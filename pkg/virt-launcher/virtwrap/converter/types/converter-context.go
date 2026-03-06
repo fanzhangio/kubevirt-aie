@@ -29,6 +29,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/os/disk"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/arch"
+	iommupci "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/iommu-pci"
 )
 
 type EFIConfiguration struct {
@@ -71,4 +72,8 @@ type ConverterContext struct {
 	PCINUMAAwareTopologyEnabled     bool
 	DomainAttachmentByInterfaceName map[string]string
 	HypervisorName                  string
+	// IommuPCI contains IOMMU capabilities detected from the host system.
+	// Used to configure SMMUv3 IOMMU devices and calculate PCI hole sizes
+	// for GPU passthrough on ARM64 systems.
+	IommuPCI *iommupci.IommuPCI
 }

@@ -46,6 +46,7 @@ import (
 	drautil "kubevirt.io/kubevirt/pkg/dra"
 	"kubevirt.io/kubevirt/pkg/hypervisor"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/device/hostdevice/dra"
+	iommupci "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/iommu-pci"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/network"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/storage"
 
@@ -1087,6 +1088,7 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		FreePageReporting:         isFreePageReportingEnabled(false, vmi),
 		SerialConsoleLog:          isSerialConsoleLogEnabled(false, vmi),
 		HypervisorName:            l.hypervisorName,
+		IommuPCI:                  iommupci.NewIommuPCI(runtime.GOARCH),
 	}
 
 	if options != nil {
@@ -1128,7 +1130,7 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		}
 		c.GenericHostDevices = genericHostDevices
 
-		gpuHostDevices, err := gpu.CreateHostDevices(vmi.Spec.Domain.Devices.GPUs)
+		gpuHostDevices, err := gpu.CreateHostDevices(vmi.Spec.Domain.Devices.GPUs, c.IommuPCI)
 		if err != nil {
 			return nil, err
 		}
