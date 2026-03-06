@@ -37,6 +37,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/iommu"
+
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
 	"kubevirt.io/client-go/precond"
@@ -61,6 +63,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/virtio"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/device"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/disksource"
+	iommupci "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/iommu-pci"
 )
 
 const (
@@ -1152,13 +1155,51 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 
 			if c.PCINUMAAwareTopologyEnabled {
 				if c.Architecture.SupportPCIePlacement() {
-					if err := PlacePCIDevicesWithNUMAAlignment(&domain.Spec); err != nil {
+					err := PlacePCIDevicesWithNUMAAlignment(&domain.Spec, c.IommuPCI)
+					if err != nil {
 						log.Log.Reason(err).Warningf("Failed to process PCIe NUMA-aware topology, falling back to default placement")
+					} else {
+						iommu.HandleIOMMU(&domain.Spec, c.IommuPCI)
+						if c.IommuPCI != nil && c.IommuPCI.PCIHoleSize != 0 {
+							holeSize := iommupci.CalculateTotalPCIHole64Size(c.IommuPCI.PCIHoleSize, iommupci.PCIHoleMarginKiB)
+
+							pcihole64CtrlExists := false
+							for i := range domain.Spec.Devices.Controllers {
+								ctrl := &domain.Spec.Devices.Controllers[i]
+								if ctrl.Type == "pci" && ctrl.Index == "0" && ctrl.Model == "pcie-root" && ctrl.PCIHole64 != nil {
+									ctrl.PCIHole64.Value = uint(holeSize)
+									pcihole64CtrlExists = true
+									break
+								}
+							}
+
+							if !pcihole64CtrlExists {
+								domain.Spec.Devices.Controllers = append(domain.Spec.Devices.Controllers,
+									api.Controller{
+										Type:  "pci",
+										Index: "0",
+										Model: "pcie-root",
+										PCIHole64: &api.PCIHole64{
+											Value: uint(holeSize),
+											Unit:  "KiB",
+										},
+									},
+								)
+							}
+						}
 					}
 				} else {
 					log.Log.Infof("Skipping PCIe NUMA alignment: architecture %s does not support PCIe placement", c.Architecture.GetArchitecture())
 				}
 			}
+		}
+	}
+
+	// clean-up "tofill" leftovers
+	for i := range domain.Spec.Devices.HostDevices {
+		hostDev := &domain.Spec.Devices.HostDevices[i]
+		if hostDev.ACPI != nil && hostDev.ACPI.NodeSet == "tofill" {
+			hostDev.ACPI = nil
 		}
 	}
 
