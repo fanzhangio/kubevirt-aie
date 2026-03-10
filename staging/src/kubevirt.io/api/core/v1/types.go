@@ -1400,6 +1400,11 @@ const (
 	// For example, 4294967296 configures a 4TiB hole.
 	PCIHole64Size string = "kubevirt.io/pciHole64Size"
 
+	// GraceVirtualizationAnnotation carries alpha Grace/Blackwell virtualization settings as JSON.
+	// Example:
+	// {"hostDevices":true,"smmuv3":true,"vcmdq":false,"egm":false}
+	GraceVirtualizationAnnotation string = "alpha.kubevirt.io/graceVirtualization"
+
 	// EvictionSourceAnnotation indicates the origin of an api initiated eviction in the VirtualMachineInstance.
 	// This annotation might be empty if the source is not a recognized actor (an admin for example).
 	// This could be useful to distinguish evictions originated from the descheduler.

@@ -1242,6 +1242,66 @@ func ValidateVirtualMachineInstanceMetadata(field *k8sfield.Path, metadata *meta
 		})
 	}
 
+	causes = append(causes, validateGraceVirtualizationAnnotation(field, annotations, config)...)
+
+	return causes
+}
+
+func validateGraceVirtualizationAnnotation(field *k8sfield.Path, annotations map[string]string, config *virtconfig.ClusterConfig) []metav1.StatusCause {
+	if len(annotations) == 0 {
+		return nil
+	}
+
+	var causes []metav1.StatusCause
+	annotationPath := field.Child("annotations").Child(v1.GraceVirtualizationAnnotation).String()
+	rawConfig := strings.TrimSpace(annotations[v1.GraceVirtualizationAnnotation])
+	if rawConfig == "" {
+		return causes
+	}
+
+	if !config.GraceIOVirtualizationEnabled() {
+		causes = append(causes, metav1.StatusCause{
+			Type: metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("GraceIOVirtualization feature gate is not enabled in kubevirt-config, invalid entry %s",
+				annotationPath),
+			Field: field.Child("annotations").String(),
+		})
+		return causes
+	}
+
+	cfg, err := parseGraceVirtualizationConfig(rawConfig)
+	if err != nil {
+		causes = append(causes, metav1.StatusCause{
+			Type: metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("invalid entry %s: failed to parse annotation value: %v",
+				annotationPath, err),
+			Field: field.Child("annotations").String(),
+		})
+		return causes
+	}
+
+	if isEnabled(cfg.VCMDQ) && !isEnabled(cfg.SMMUv3) {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("invalid entry %s: vcmdq requires smmuv3=true", annotationPath),
+			Field:   field.Child("annotations").String(),
+		})
+	}
+	if isEnabled(cfg.EGM) && !isEnabled(cfg.SMMUv3) {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("invalid entry %s: egm requires smmuv3=true", annotationPath),
+			Field:   field.Child("annotations").String(),
+		})
+	}
+	if isEnabled(cfg.EGM) && !isEnabled(cfg.HostDevices) {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("invalid entry %s: egm requires hostDevices=true", annotationPath),
+			Field:   field.Child("annotations").String(),
+		})
+	}
+
 	return causes
 }
 

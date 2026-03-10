@@ -454,6 +454,10 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 				map[string]string{hooks.HookSidecarListAnnotationName: "[{'image': 'fake-image'}]"},
 				fmt.Sprintf("invalid entry metadata.annotations.%s", hooks.HookSidecarListAnnotationName),
 			),
+			Entry("without GraceIOVirtualization feature gate enabled",
+				map[string]string{v1.GraceVirtualizationAnnotation: `{"hostDevices":true}`},
+				fmt.Sprintf("invalid entry metadata.annotations.%s", v1.GraceVirtualizationAnnotation),
+			),
 		)
 
 		DescribeTable("should accept annotations which require feature gate enabled", func(annotations map[string]string, featureGate string) {
@@ -477,7 +481,49 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 				map[string]string{hooks.HookSidecarListAnnotationName: "[{'image': 'fake-image'}]"},
 				featuregate.SidecarGate,
 			),
+			Entry("with GraceIOVirtualization feature gate enabled",
+				map[string]string{v1.GraceVirtualizationAnnotation: `{"hostDevices":true}`},
+				featuregate.GraceIOVirtualization,
+			),
 		)
+
+		DescribeTable("should reject invalid grace virtualization annotation payloads", func(payload, expectedMsg string) {
+			enableFeatureGates(featuregate.GraceIOVirtualization)
+			vmi := newBaseVmi()
+			vmi.Annotations = map[string]string{v1.GraceVirtualizationAnnotation: payload}
+
+			ar, err := newAdmissionReviewForVMICreation(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			ar.Request.UserInfo = authv1.UserInfo{Username: "fake-account"}
+
+			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
+			Expect(resp.Allowed).To(BeFalse())
+			Expect(resp.Result.Details.Causes).To(HaveLen(1))
+			Expect(resp.Result.Details.Causes[0].Type).To(Equal(metav1.CauseTypeFieldValueInvalid))
+			Expect(resp.Result.Details.Causes[0].Message).To(ContainSubstring(expectedMsg))
+		},
+			Entry("invalid JSON",
+				`{"hostDevices":true`,
+				"failed to parse annotation value",
+			),
+			Entry("unknown field",
+				`{"hostDevices":true,"unknown":true}`,
+				"failed to parse annotation value",
+			),
+			Entry("vcmdq requires smmuv3",
+				`{"hostDevices":true,"vcmdq":true,"smmuv3":false}`,
+				"vcmdq requires smmuv3=true",
+			),
+			Entry("egm requires smmuv3",
+				`{"hostDevices":true,"egm":true,"smmuv3":false}`,
+				"egm requires smmuv3=true",
+			),
+			Entry("egm requires hostDevices",
+				`{"hostDevices":false,"egm":true,"smmuv3":true}`,
+				"egm requires hostDevices=true",
+			),
+		)
+
 	})
 
 	Context("with VirtualMachineInstance spec", func() {
