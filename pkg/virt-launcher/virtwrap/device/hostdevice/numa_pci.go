@@ -1,8 +1,13 @@
 package hostdevice
 
 import (
+	"bufio"
 	"crypto/sha1"
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -35,6 +40,15 @@ const (
 	HotplugRootPortAliasPrefix     = "hotplug-rp-"
 	numaHotplugAliasDiscriminator  = "numa-"
 	NUMAHotplugRootPortAliasPrefix = HotplugRootPortAliasPrefix + numaHotplugAliasDiscriminator
+
+	arm64Architecture        = "arm64"
+	defaultHostDeviceIOMMUFD = "yes"
+
+	ioResourceMemFlag                 = 0x00000200
+	largeMMIOPXBIsolationThresholdGiB = uint64(128)
+	largeMMIOPXBIsolationThreshold    = largeMMIOPXBIsolationThresholdGiB << 30
+	graceHBMNodesPerGPU               = 8
+	graceHBMNodeSetBase               = 1
 )
 
 var (
@@ -44,6 +58,7 @@ var (
 	getDevicePCIProximityGroupFunc = hardware.GetDevicePCITopologyGroup
 	getDevicePCIPathHierarchyFunc  = hardware.GetDevicePCIPathHierarchy
 	getDeviceIOMMUGroupInfoFunc    = hardware.GetDeviceIOMMUGroupInfo
+	getDevicePCITotalMMIOSizeFunc  = getDevicePCITotalMMIOSize
 )
 
 // NormalizeHotplugRootPortAlias strips any user-alias prefixes (like "ua-") that libvirt may add.
@@ -87,6 +102,10 @@ type numaPCIPlanner struct {
 	existingRootPorts   map[string]*rootPortInfo
 	nextRootHotplugSlot int
 	nextRootHotplugPort int
+	// When enabled, NUMA PXB controllers are emitted without user aliases so libvirt
+	// keeps the default PCI controller IDs (pci.<index>), which are required by
+	// libvirt-native smmuv3 driver pciBus wiring.
+	useDefaultPXBIDs bool
 }
 
 type pxbInfo struct {
@@ -136,21 +155,32 @@ type deviceNUMAInfo struct {
 	iommuGroup      int
 	iommuPeers      []string
 	mappingAccurate bool
+	dedicatedPXB    bool
 }
 
 type deviceGroupKey struct {
 	guestNUMANode int
 	hostNUMANode  int
 	pathKey       string
+	pxbGroup      string
 }
 
 type pxbKey struct {
 	guestNUMANode int
 	hostNUMANode  int
+	pxbGroup      string
 }
 
 func pxbAlias(hostNUMA, guestNUMA int) string {
 	return fmt.Sprintf("%s-%d-%d", numaPXBAliasPrefix, hostNUMA, guestNUMA)
+}
+
+func pxbAliasForGroup(hostNUMA, guestNUMA int, pxbGroup string) string {
+	if pxbGroup == "" {
+		return pxbAlias(hostNUMA, guestNUMA)
+	}
+	sum := sha1.Sum([]byte(pxbGroup))
+	return fmt.Sprintf("%s-%d-%d-%x", numaPXBAliasPrefix, hostNUMA, guestNUMA, sum[:4])
 }
 
 func rootPortAlias(key deviceGroupKey) string {
@@ -216,6 +246,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	if vmi == nil || domain == nil {
 		return
 	}
+	graceCfg := parseGraceVirtualizationConfig(vmi)
+	graceHostDevicesEnabled := isGraceHostDevicesEnabledForArch(vmi, graceCfg)
+
 	log.Log.V(1).Info("evaluating host device NUMA topology passthrough")
 	// Host devcies NUMA passthrough only works when CPU NUMA passthrough is enabled
 	// because without CPU NUMA passthrough, there will be only one NUMA node in the guest
@@ -236,6 +269,8 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	log.Log.V(1).Infof("NUMA host device topology: processing %d host devices", len(hostDevices))
 
 	planner := newNUMAPCIPlanner(domain)
+	graceSMMUv3Enabled := graceHostDevicesEnabled && graceCfg != nil && graceCfg.SMMUv3 != nil && *graceCfg.SMMUv3
+	planner.useDefaultPXBIDs = graceSMMUv3Enabled
 	devicesWithNUMA := make([]deviceNUMAInfo, 0, len(hostDevices))
 	hostNUMANodes := make(map[int]struct{})
 	guestNUMANodes := getGuestNUMANodes(domain)
@@ -301,6 +336,10 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			iommuGroup:      iommuGroup,
 			iommuPeers:      iommuPeers,
 			mappingAccurate: mappingAccurate,
+			dedicatedPXB: shouldUseDedicatedPXBForDevice(deviceNUMAInfo{
+				dev: dev,
+				bdf: bdf,
+			}, graceHostDevicesEnabled),
 		})
 		hostNUMANodes[numaNode] = struct{}{}
 	}
@@ -349,6 +388,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		} else {
 			log.Log.V(1).Infof("host device %s grouped to host NUMA %d (guest NUMA %d) path %q", info.bdf, groupKey.hostNUMANode, groupKey.guestNUMANode, groupKey.pathKey)
 		}
+		if info.dedicatedPXB {
+			groupKey.pxbGroup = info.pathKey
+		}
 		grouped[groupKey] = append(grouped[groupKey], info)
 	}
 
@@ -370,7 +412,13 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			return 1
 		}
 		if a.pathKey == b.pathKey {
-			return 0
+			if a.pxbGroup == b.pxbGroup {
+				return 0
+			}
+			if a.pxbGroup < b.pxbGroup {
+				return -1
+			}
+			return 1
 		}
 		if a.pathKey < b.pathKey {
 			return -1
@@ -404,7 +452,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		log.Log.V(1).Infof("setting up PCI expander bus for host NUMA %d (guest NUMA %d) path %q with %d devices",
 			key.hostNUMANode, key.guestNUMANode, pathLabel, len(infos))
 
-		pxb, err := planner.ensurePXB(key.hostNUMANode, key.guestNUMANode)
+		pxb, err := planner.ensurePXBForGroup(key.hostNUMANode, key.guestNUMANode, key.pxbGroup)
 		if err != nil {
 			log.Log.Reason(err).Errorf("failed to create PCI expander bus for host NUMA %d (guest NUMA %d)", key.hostNUMANode, key.guestNUMANode)
 			continue
@@ -445,9 +493,14 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			}
 
 			assignHostDeviceToRootPort(info.dev, rootPort)
+			if graceHostDevicesEnabled {
+				applyGraceHostDeviceSettings(info.dev, key.guestNUMANode, info.dedicatedPXB)
+			}
 			log.Log.V(1).Infof("assigned host device %s to host NUMA %d (guest NUMA %d) via controller %d", info.bdf, key.hostNUMANode, key.guestNUMANode, rootPort.controllerIndex)
 		}
 	}
+
+	applyGraceSMMUv3IOMMUTopology(domain, graceCfg, graceHostDevicesEnabled)
 
 }
 
@@ -659,14 +712,19 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 }
 
 func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
+	return p.ensurePXBForGroup(hostNUMA, guestNUMA, "")
+}
+
+func (p *numaPCIPlanner) ensurePXBForGroup(hostNUMA, guestNUMA int, pxbGroup string) (*pxbInfo, error) {
 	key := pxbKey{
 		hostNUMANode:  hostNUMA,
 		guestNUMANode: guestNUMA,
+		pxbGroup:      pxbGroup,
 	}
 	if existing, ok := p.pxbs[key]; ok {
 		return existing, nil
 	}
-	alias := pxbAlias(hostNUMA, guestNUMA)
+	alias := pxbAliasForGroup(hostNUMA, guestNUMA, pxbGroup)
 	if existing, ok := p.existingPXBs[alias]; ok {
 		info := &pxbInfo{
 			index:            existing.index,
@@ -686,13 +744,23 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 		return nil, fmt.Errorf("no PXB slots available on root bus (slots 0x%02x-0x%02x reserved for hotplug)", rootHotplugSlotStart, maxRootBusSlot)
 	}
 
-	// Calculate well-separated bus number: base + (hostNUMA * spacing)
-	// This gives: NUMA 0 = 0x20 (32), NUMA 1 = 0x40 (64), NUMA 2 = 0x60 (96), etc.
-	// Provides ~32 bus numbers per hierarchy for bridges and subordinate buses
-	busNr := pxbBusNumberBase + (hostNUMA * pxbBusNumberSpacing)
-	if busNr > maxPCIBusNumber {
-		return nil, fmt.Errorf("calculated PXB bus number 0x%02x exceeds maximum 0x%02x for host NUMA %d", busNr, maxPCIBusNumber, hostNUMA)
+	baseBusNr := pxbBusNumberBase + (hostNUMA * pxbBusNumberSpacing)
+	if baseBusNr > maxPCIBusNumber {
+		return nil, fmt.Errorf("calculated PXB base bus number 0x%02x exceeds maximum 0x%02x for host NUMA %d", baseBusNr, maxPCIBusNumber, hostNUMA)
 	}
+
+	// Keep historical bus placement for shared-per-NUMA PXBs, but allocate distinct buses
+	// for dedicated high-MMIO groups to prevent large BAR endpoints from competing for the
+	// same host bridge aperture.
+	busNr := baseBusNr
+	if pxbGroup != "" {
+		dedicatedBusNr, err := p.allocateDedicatedPXBBusNumber(baseBusNr)
+		if err != nil {
+			return nil, err
+		}
+		busNr = dedicatedBusNr
+	}
+
 	p.reservePCIBus(busNr)
 
 	nodeVal := guestNUMA
@@ -707,7 +775,6 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 			BusNr: strconv.Itoa(busNr),
 			Node:  &nodeVal,
 		},
-		Alias: api.NewUserDefinedAlias(alias),
 		Address: &api.Address{
 			Type:     api.AddressPCI,
 			Domain:   rootBusDomain,
@@ -715,6 +782,9 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 			Slot:     fmt.Sprintf("0x%02x", slot),
 			Function: "0x0",
 		},
+	}
+	if !p.useDefaultPXBIDs {
+		controller.Alias = api.NewUserDefinedAlias(alias)
 	}
 
 	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
@@ -730,6 +800,25 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 	p.existingPXBs[alias] = info
 	log.Log.V(1).Infof("NUMA PCI Planner: Created PXB controller index=%d, busNr=%d (0x%02x), slot=0x%02x", index, busNr, busNr, slot)
 	return info, nil
+}
+
+func (p *numaPCIPlanner) allocateDedicatedPXBBusNumber(baseBusNr int) (int, error) {
+	lower := baseBusNr + 1
+	// Keep one bus of headroom so firmware/qemu auto-assigned downstream buses for
+	// the first root port on this PXB do not collide with the next NUMA base bus.
+	upper := baseBusNr + pxbBusNumberSpacing - 2
+	if upper > maxPCIBusNumber {
+		upper = maxPCIBusNumber
+	}
+	// Allocate every other bus (odd offset from base). This avoids adjacent PXB bus
+	// numbers like 0x41/0x42, which can conflict with libvirt/qemu auto secondary-bus
+	// assignment for root ports behind the first PXB.
+	for bus := lower; bus <= upper; bus += 2 {
+		if _, used := p.usedPCIBuses[bus]; !used {
+			return bus, nil
+		}
+	}
+	return 0, fmt.Errorf("no free dedicated PXB bus available in range 0x%02x-0x%02x", lower, upper)
 }
 
 func (p *numaPCIPlanner) ensureRootPortForGroup(pxb *pxbInfo, key deviceGroupKey) (*rootPortInfo, error) {
@@ -1205,6 +1294,252 @@ func assignHostDeviceToRootPort(dev *api.HostDevice, port *rootPortInfo) {
 	dev.Address.Bus = strconv.Itoa(port.controllerIndex)
 	dev.Address.Slot = "0x00"
 	dev.Address.Function = "0x0"
+}
+
+type graceVirtualizationHostDeviceConfig struct {
+	HostDevices *bool `json:"hostDevices,omitempty"`
+	SMMUv3      *bool `json:"smmuv3,omitempty"`
+	VCMDQ       *bool `json:"vcmdq,omitempty"`
+	EGM         *bool `json:"egm,omitempty"`
+	// Parsed for forward-compatibility; runtime handling comes in follow-up work.
+	NUMAStrictLocality *bool `json:"numaStrictLocality,omitempty"`
+}
+
+func parseGraceVirtualizationConfig(vmi *v1.VirtualMachineInstance) *graceVirtualizationHostDeviceConfig {
+	if vmi == nil || len(vmi.Annotations) == 0 {
+		return nil
+	}
+
+	rawConfig, exists := vmi.Annotations[v1.GraceVirtualizationAnnotation]
+	if !exists {
+		return nil
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(rawConfig)))
+	decoder.DisallowUnknownFields()
+
+	cfg := &graceVirtualizationHostDeviceConfig{}
+	if err := decoder.Decode(cfg); err != nil {
+		log.Log.V(1).Reason(err).Infof("ignoring invalid %s annotation", v1.GraceVirtualizationAnnotation)
+		return nil
+	}
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		log.Log.V(1).Infof("ignoring invalid %s annotation: trailing content detected", v1.GraceVirtualizationAnnotation)
+		return nil
+	}
+	return cfg
+}
+
+func isGraceHostDevicesEnabledForArch(vmi *v1.VirtualMachineInstance, cfg *graceVirtualizationHostDeviceConfig) bool {
+	if cfg == nil || cfg.HostDevices == nil || !*cfg.HostDevices {
+		return false
+	}
+	arch := strings.TrimSpace(vmi.Spec.Architecture)
+	return arch == "" || strings.EqualFold(arch, arm64Architecture)
+}
+
+func applyGraceSMMUv3IOMMUTopology(domain *api.Domain, cfg *graceVirtualizationHostDeviceConfig, graceHostDevicesEnabled bool) {
+	if domain == nil {
+		return
+	}
+
+	// Cleanup any legacy raw qemu SMMUv3 args from previous implementation revisions.
+	removeGraceSMMUv3QEMUArgs(domain)
+
+	filtered := make([]api.IOMMU, 0, len(domain.Spec.Devices.IOMMUs))
+	for i := range domain.Spec.Devices.IOMMUs {
+		if strings.EqualFold(domain.Spec.Devices.IOMMUs[i].Model, "smmuv3") {
+			continue
+		}
+		filtered = append(filtered, domain.Spec.Devices.IOMMUs[i])
+	}
+	domain.Spec.Devices.IOMMUs = filtered
+
+	if !graceHostDevicesEnabled || cfg == nil || cfg.SMMUv3 == nil || !*cfg.SMMUv3 {
+		return
+	}
+
+	pciBuses := collectNUMAPXBPciBuses(domain)
+	for _, pciBus := range pciBuses {
+		driver := &api.IOMMUDriver{
+			PCIBus: pciBus,
+			Accel:  "on",
+			ATS:    "on",
+			RIL:    "off",
+			PASID:  "on",
+			OAS:    "48",
+		}
+		if cfg.VCMDQ != nil && *cfg.VCMDQ {
+			driver.CMDQV = "on"
+		}
+		domain.Spec.Devices.IOMMUs = append(domain.Spec.Devices.IOMMUs, api.IOMMU{
+			Model:  "smmuv3",
+			Driver: driver,
+		})
+	}
+}
+
+func removeGraceSMMUv3QEMUArgs(domain *api.Domain) {
+	if domain == nil || domain.Spec.QEMUCmd == nil || len(domain.Spec.QEMUCmd.QEMUArg) == 0 {
+		return
+	}
+
+	filtered := make([]api.Arg, 0, len(domain.Spec.QEMUCmd.QEMUArg))
+	for i := 0; i < len(domain.Spec.QEMUCmd.QEMUArg); i++ {
+		arg := domain.Spec.QEMUCmd.QEMUArg[i]
+		if arg.Value == "-device" && i+1 < len(domain.Spec.QEMUCmd.QEMUArg) &&
+			strings.Contains(domain.Spec.QEMUCmd.QEMUArg[i+1].Value, "arm-smmuv3") {
+			i++
+			continue
+		}
+		if strings.Contains(arg.Value, "arm-smmuv3") {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+
+	if len(filtered) == 0 {
+		domain.Spec.QEMUCmd = nil
+		return
+	}
+	domain.Spec.QEMUCmd.QEMUArg = filtered
+}
+
+func collectNUMAPXBPciBuses(domain *api.Domain) []string {
+	type pxbRef struct {
+		busNr int
+		index int
+	}
+	pxbs := make([]pxbRef, 0)
+	for i := range domain.Spec.Devices.Controllers {
+		ctrl := domain.Spec.Devices.Controllers[i]
+		if ctrl.Model != "pcie-expander-bus" || ctrl.Target == nil {
+			continue
+		}
+		if strings.TrimSpace(ctrl.Target.BusNr) == "" {
+			continue
+		}
+		busNr, err := parseBusNumber(ctrl.Target.BusNr)
+		if err != nil {
+			continue
+		}
+		index, err := strconv.Atoi(ctrl.Index)
+		if err != nil || index <= 0 {
+			continue
+		}
+		pxbs = append(pxbs, pxbRef{
+			busNr: busNr,
+			index: index,
+		})
+	}
+
+	slices.SortFunc(pxbs, func(a, b pxbRef) int {
+		if a.busNr == b.busNr {
+			if a.index == b.index {
+				return 0
+			}
+			if a.index < b.index {
+				return -1
+			}
+			return 1
+		}
+		if a.busNr < b.busNr {
+			return -1
+		}
+		return 1
+	})
+
+	buses := make([]string, 0, len(pxbs))
+	for i := range pxbs {
+		// Libvirt native smmuv3 wiring uses <iommu><driver pciBus='N'/></iommu>,
+		// where N maps to the pcie-expander-bus controller index.
+		buses = append(buses, strconv.Itoa(pxbs[i].index))
+	}
+	return buses
+}
+
+func applyGraceHostDeviceSettings(dev *api.HostDevice, guestNUMANode int, dedicatedPXB bool) {
+	if dev == nil || dev.Type != api.HostDevicePCI {
+		return
+	}
+
+	if dev.Driver == nil {
+		dev.Driver = &api.HostDeviceDriver{}
+	}
+	dev.Driver.IOMMUFD = defaultHostDeviceIOMMUFD
+
+	nodeSet := strconv.Itoa(guestNUMANode)
+	if dedicatedPXB {
+		nodeSet = graceGPUHBMNodeSet(guestNUMANode)
+	}
+	dev.ACPI = &api.HostDeviceACPI{
+		NodeSet: nodeSet,
+	}
+}
+
+func graceGPUHBMNodeSet(guestNUMANode int) string {
+	if guestNUMANode < 0 {
+		return strconv.Itoa(unifiedNUMAGroup)
+	}
+	start := (guestNUMANode * graceHBMNodesPerGPU) + graceHBMNodeSetBase
+	end := start + graceHBMNodesPerGPU - 1
+	return fmt.Sprintf("%d-%d", start, end)
+}
+
+func shouldUseDedicatedPXBForDevice(info deviceNUMAInfo, graceHostDevicesEnabled bool) bool {
+	if !graceHostDevicesEnabled || info.dev == nil || info.dev.Type != api.HostDevicePCI {
+		return false
+	}
+	totalMMIO, err := getDevicePCITotalMMIOSizeFunc(info.bdf)
+	if err != nil {
+		log.Log.V(1).Reason(err).Infof("unable to inspect PCI MMIO footprint for host device %s", info.bdf)
+		return false
+	}
+	if totalMMIO < largeMMIOPXBIsolationThreshold {
+		return false
+	}
+	log.Log.V(1).Infof("host device %s exposes %d GiB MMIO aperture; allocating dedicated PXB hierarchy",
+		info.bdf, totalMMIO>>30)
+	return true
+}
+
+func getDevicePCITotalMMIOSize(bdf string) (uint64, error) {
+	resourcePath := filepath.Join("/sys/bus/pci/devices", bdf, "resource")
+	f, err := os.Open(resourcePath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	var total uint64
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		start, err := strconv.ParseUint(fields[0], 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		end, err := strconv.ParseUint(fields[1], 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		flags, err := strconv.ParseUint(fields[2], 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		if flags&ioResourceMemFlag == 0 || (start == 0 && end == 0) || end < start {
+			continue
+		}
+		total += end - start + 1
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func resolveHostDevicePCIAddress(dev *api.HostDevice) (string, error) {

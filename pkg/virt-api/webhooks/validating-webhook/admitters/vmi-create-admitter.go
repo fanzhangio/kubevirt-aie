@@ -127,6 +127,13 @@ func (admitter *VMICreateAdmitter) Admit(_ context.Context, ar *admissionv1.Admi
 
 	_, isKubeVirtServiceAccount := admitter.KubeVirtServiceAccounts[ar.Request.UserInfo.Username]
 	causes = append(causes, ValidateVirtualMachineInstanceMetadata(k8sfield.NewPath("metadata"), &vmi.ObjectMeta, admitter.ClusterConfig, isKubeVirtServiceAccount)...)
+	causes = append(causes, validateGraceVirtualizationAnnotation(
+		k8sfield.NewPath("metadata"),
+		k8sfield.NewPath("spec"),
+		vmi.Annotations,
+		&vmi.Spec,
+		admitter.ClusterConfig,
+	)...)
 	causes = append(causes, webhooks.ValidateVirtualMachineInstanceHyperv(k8sfield.NewPath("spec").Child("domain").Child("features").Child("hyperv"), &vmi.Spec)...)
 	causes = append(causes, ValidateVirtualMachineInstancePerArch(k8sfield.NewPath("spec"), &vmi.Spec)...)
 	if len(causes) > 0 {
@@ -1242,18 +1249,16 @@ func ValidateVirtualMachineInstanceMetadata(field *k8sfield.Path, metadata *meta
 		})
 	}
 
-	causes = append(causes, validateGraceVirtualizationAnnotation(field, annotations, config)...)
-
 	return causes
 }
 
-func validateGraceVirtualizationAnnotation(field *k8sfield.Path, annotations map[string]string, config *virtconfig.ClusterConfig) []metav1.StatusCause {
+func validateGraceVirtualizationAnnotation(metadataField, specField *k8sfield.Path, annotations map[string]string, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
 	if len(annotations) == 0 {
 		return nil
 	}
 
 	var causes []metav1.StatusCause
-	annotationPath := field.Child("annotations").Child(v1.GraceVirtualizationAnnotation).String()
+	annotationPath := metadataField.Child("annotations").Child(v1.GraceVirtualizationAnnotation).String()
 	rawConfig := strings.TrimSpace(annotations[v1.GraceVirtualizationAnnotation])
 	if rawConfig == "" {
 		return causes
@@ -1264,7 +1269,7 @@ func validateGraceVirtualizationAnnotation(field *k8sfield.Path, annotations map
 			Type: metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("GraceIOVirtualization feature gate is not enabled in kubevirt-config, invalid entry %s",
 				annotationPath),
-			Field: field.Child("annotations").String(),
+			Field: metadataField.Child("annotations").String(),
 		})
 		return causes
 	}
@@ -1275,7 +1280,7 @@ func validateGraceVirtualizationAnnotation(field *k8sfield.Path, annotations map
 			Type: metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: failed to parse annotation value: %v",
 				annotationPath, err),
-			Field: field.Child("annotations").String(),
+			Field: metadataField.Child("annotations").String(),
 		})
 		return causes
 	}
@@ -1284,25 +1289,40 @@ func validateGraceVirtualizationAnnotation(field *k8sfield.Path, annotations map
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: vcmdq requires smmuv3=true", annotationPath),
-			Field:   field.Child("annotations").String(),
+			Field:   metadataField.Child("annotations").String(),
 		})
 	}
 	if isEnabled(cfg.EGM) && !isEnabled(cfg.SMMUv3) {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: egm requires smmuv3=true", annotationPath),
-			Field:   field.Child("annotations").String(),
+			Field:   metadataField.Child("annotations").String(),
 		})
 	}
 	if isEnabled(cfg.EGM) && !isEnabled(cfg.HostDevices) {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: egm requires hostDevices=true", annotationPath),
-			Field:   field.Child("annotations").String(),
+			Field:   metadataField.Child("annotations").String(),
+		})
+	}
+	if isEnabled(cfg.VCMDQ) && isEnabled(cfg.SMMUv3) && !isEnabled(cfg.EGM) && !hasHugepagesConfigured(spec) {
+		causes = append(causes, metav1.StatusCause{
+			Type: metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("invalid entry %s: vcmdq requires hugepages unless egm=true",
+				annotationPath),
+			Field: specField.Child("domain", "memory", "hugepages").String(),
 		})
 	}
 
 	return causes
+}
+
+func hasHugepagesConfigured(spec *v1.VirtualMachineInstanceSpec) bool {
+	return spec != nil &&
+		spec.Domain.Memory != nil &&
+		spec.Domain.Memory.Hugepages != nil &&
+		strings.TrimSpace(spec.Domain.Memory.Hugepages.PageSize) != ""
 }
 
 // Copied from kubernetes/pkg/apis/core/validation/validation.go

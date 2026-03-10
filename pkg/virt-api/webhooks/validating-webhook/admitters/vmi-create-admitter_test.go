@@ -522,7 +522,43 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 				`{"hostDevices":false,"egm":true,"smmuv3":true}`,
 				"egm requires hostDevices=true",
 			),
+			Entry("vcmdq requires hugepages when egm is disabled",
+				`{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":false}`,
+				"vcmdq requires hugepages unless egm=true",
+			),
 		)
+
+		It("should accept vcmdq without hugepages when egm is enabled", func() {
+			enableFeatureGates(featuregate.GraceIOVirtualization)
+			vmi := newBaseVmi()
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":true}`,
+			}
+
+			ar, err := newAdmissionReviewForVMICreation(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			ar.Request.UserInfo = authv1.UserInfo{Username: "fake-account"}
+
+			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
+			Expect(resp.Allowed).To(BeTrue())
+			Expect(resp.Result).To(BeNil())
+		})
+
+		It("should accept vcmdq when hugepages are configured", func() {
+			enableFeatureGates(featuregate.GraceIOVirtualization)
+			vmi := newBaseVmi(libvmi.WithHugepages("2Mi"))
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":false}`,
+			}
+
+			ar, err := newAdmissionReviewForVMICreation(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			ar.Request.UserInfo = authv1.UserInfo{Username: "fake-account"}
+
+			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
+			Expect(resp.Allowed).To(BeTrue())
+			Expect(resp.Result).To(BeNil())
+		})
 
 	})
 
