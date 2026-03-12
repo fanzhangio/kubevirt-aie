@@ -24,6 +24,11 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
+
+	v1 "kubevirt.io/api/core/v1"
 )
 
 type graceVirtualizationConfig struct {
@@ -53,4 +58,47 @@ func parseGraceVirtualizationConfig(raw string) (*graceVirtualizationConfig, err
 
 func isEnabled(value *bool) bool {
 	return value != nil && *value
+}
+
+func graceEGMEnabled(annotations map[string]string) bool {
+	if len(annotations) == 0 {
+		return false
+	}
+
+	rawConfig, exists := annotations[v1.GraceVirtualizationAnnotation]
+	if !exists || strings.TrimSpace(rawConfig) == "" {
+		return false
+	}
+
+	cfg, err := parseGraceVirtualizationConfig(rawConfig)
+	return err == nil && isEnabled(cfg.EGM)
+}
+
+func filterNUMAHugepagesRequirementForGraceEGM(causes []metav1.StatusCause, field *k8sfield.Path, annotations map[string]string) []metav1.StatusCause {
+	if len(annotations) == 0 {
+		return causes
+	}
+
+	rawConfig, exists := annotations[v1.GraceVirtualizationAnnotation]
+	if !exists || strings.TrimSpace(rawConfig) == "" {
+		return causes
+	}
+
+	cfg, err := parseGraceVirtualizationConfig(rawConfig)
+	if err != nil || !isEnabled(cfg.EGM) {
+		return causes
+	}
+
+	hugepagesField := field.Child("domain", "memory", "hugepages").String()
+	numaField := field.Child("domain", "cpu", "numa", "guestMappingPassthrough").String()
+	filtered := causes[:0]
+	for _, cause := range causes {
+		if cause.Field == numaField &&
+			strings.Contains(cause.Message, hugepagesField) &&
+			strings.Contains(cause.Message, "NUMA topology strategy") {
+			continue
+		}
+		filtered = append(filtered, cause)
+	}
+	return filtered
 }

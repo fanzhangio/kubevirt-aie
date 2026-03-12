@@ -488,7 +488,7 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 		)
 
 		DescribeTable("should reject invalid grace virtualization annotation payloads", func(payload, expectedMsg string) {
-			enableFeatureGates(featuregate.GraceIOVirtualization)
+			enableFeatureGates(featuregate.GraceIOVirtualization, featuregate.NUMAFeatureGate)
 			vmi := newBaseVmi()
 			vmi.Annotations = map[string]string{v1.GraceVirtualizationAnnotation: payload}
 
@@ -498,9 +498,15 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 
 			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
 			Expect(resp.Allowed).To(BeFalse())
-			Expect(resp.Result.Details.Causes).To(HaveLen(1))
-			Expect(resp.Result.Details.Causes[0].Type).To(Equal(metav1.CauseTypeFieldValueInvalid))
-			Expect(resp.Result.Details.Causes[0].Message).To(ContainSubstring(expectedMsg))
+			Expect(resp.Result.Details.Causes).ToNot(BeEmpty())
+			found := false
+			for _, cause := range resp.Result.Details.Causes {
+				if cause.Type == metav1.CauseTypeFieldValueInvalid && strings.Contains(cause.Message, expectedMsg) {
+					found = true
+					break
+				}
+			}
+			Expect(found).To(BeTrue(), "expected cause containing %q", expectedMsg)
 		},
 			Entry("invalid JSON",
 				`{"hostDevices":true`,
@@ -522,15 +528,30 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 				`{"hostDevices":false,"egm":true,"smmuv3":true}`,
 				"egm requires hostDevices=true",
 			),
+			Entry("egm requires dedicated CPU placement",
+				`{"hostDevices":true,"egm":true,"smmuv3":true}`,
+				"egm requires domain.cpu.dedicatedCpuPlacement=true",
+			),
 			Entry("vcmdq requires hugepages when egm is disabled",
 				`{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":false}`,
-				"vcmdq requires hugepages unless egm=true",
+				"vcmdq requires domain.memory.hugepages",
 			),
 		)
 
-		It("should accept vcmdq without hugepages when egm is enabled", func() {
+		It("should accept Grace EGM+VCMDQ configuration without hugepages", func() {
 			enableFeatureGates(featuregate.GraceIOVirtualization)
-			vmi := newBaseVmi()
+			vmi := newBaseVmi(
+				libvmi.WithDedicatedCPUPlacement(),
+			)
+			vmi.Spec.Domain.CPU.Cores = 1
+			if vmi.Spec.Domain.Resources.Requests == nil {
+				vmi.Spec.Domain.Resources.Requests = k8sv1.ResourceList{}
+			}
+			if vmi.Spec.Domain.Resources.Limits == nil {
+				vmi.Spec.Domain.Resources.Limits = k8sv1.ResourceList{}
+			}
+			vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceCPU] = resource.MustParse("1")
+			vmi.Spec.Domain.Resources.Limits[k8sv1.ResourceCPU] = resource.MustParse("1")
 			vmi.Annotations = map[string]string{
 				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":true}`,
 			}
@@ -542,6 +563,62 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
 			Expect(resp.Allowed).To(BeTrue())
 			Expect(resp.Result).To(BeNil())
+		})
+
+		It("should reject Grace EGM+VCMDQ configuration with hugepages", func() {
+			enableFeatureGates(featuregate.GraceIOVirtualization)
+			vmi := newBaseVmi(
+				libvmi.WithDedicatedCPUPlacement(),
+				libvmi.WithHugepages("2Mi"),
+			)
+			vmi.Spec.Domain.CPU.Cores = 1
+			if vmi.Spec.Domain.Resources.Requests == nil {
+				vmi.Spec.Domain.Resources.Requests = k8sv1.ResourceList{}
+			}
+			if vmi.Spec.Domain.Resources.Limits == nil {
+				vmi.Spec.Domain.Resources.Limits = k8sv1.ResourceList{}
+			}
+			vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceCPU] = resource.MustParse("1")
+			vmi.Spec.Domain.Resources.Limits[k8sv1.ResourceCPU] = resource.MustParse("1")
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":true}`,
+			}
+
+			ar, err := newAdmissionReviewForVMICreation(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			ar.Request.UserInfo = authv1.UserInfo{Username: "fake-account"}
+
+			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
+			Expect(resp.Allowed).To(BeFalse())
+			Expect(resp.Result.Details.Causes).To(ContainElement(HaveField("Message", ContainSubstring("egm requires EGM-backed file memory and does not support domain.memory.hugepages"))))
+		})
+
+		It("should reject Grace EGM configuration when hugepages are requested", func() {
+			enableFeatureGates(featuregate.GraceIOVirtualization)
+			vmi := newBaseVmi(
+				libvmi.WithDedicatedCPUPlacement(),
+				libvmi.WithHugepages("2Mi"),
+			)
+			vmi.Spec.Domain.CPU.Cores = 1
+			if vmi.Spec.Domain.Resources.Requests == nil {
+				vmi.Spec.Domain.Resources.Requests = k8sv1.ResourceList{}
+			}
+			if vmi.Spec.Domain.Resources.Limits == nil {
+				vmi.Spec.Domain.Resources.Limits = k8sv1.ResourceList{}
+			}
+			vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceCPU] = resource.MustParse("1")
+			vmi.Spec.Domain.Resources.Limits[k8sv1.ResourceCPU] = resource.MustParse("1")
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"egm":true}`,
+			}
+
+			ar, err := newAdmissionReviewForVMICreation(vmi)
+			Expect(err).ToNot(HaveOccurred())
+			ar.Request.UserInfo = authv1.UserInfo{Username: "fake-account"}
+
+			resp := vmiCreateAdmitter.Admit(context.Background(), ar)
+			Expect(resp.Allowed).To(BeFalse())
+			Expect(resp.Result.Details.Causes).To(ContainElement(HaveField("Message", ContainSubstring("egm requires EGM-backed file memory and does not support domain.memory.hugepages"))))
 		})
 
 		It("should accept vcmdq when hugepages are configured", func() {

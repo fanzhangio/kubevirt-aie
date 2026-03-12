@@ -1744,6 +1744,189 @@ var _ = Describe("Converter", func() {
 			Expect(domainSpec.Memory.Unit).To(Equal("b"))
 		})
 
+		It("should use file-backed shared memory for Grace EGM", func() {
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"egm":true}`,
+			}
+
+			domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
+			Expect(domainSpec.MemoryBacking).ToNot(BeNil())
+			Expect(domainSpec.MemoryBacking.HugePages).To(BeNil())
+			Expect(domainSpec.MemoryBacking.Source).ToNot(BeNil())
+			Expect(domainSpec.MemoryBacking.Source.Type).To(Equal("file"))
+			Expect(domainSpec.MemoryBacking.Access).ToNot(BeNil())
+			Expect(domainSpec.MemoryBacking.Access.Mode).To(Equal("shared"))
+			Expect(domainSpec.MemoryBacking.Allocation).ToNot(BeNil())
+			Expect(domainSpec.MemoryBacking.Allocation.Mode).To(Equal(api.MemoryAllocationModeImmediate))
+		})
+
+		It("should reject hugepages for Grace EGM without vcmdq", func() {
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			vmi.Spec.Domain.Memory = &v1.Memory{
+				Hugepages: &v1.Hugepages{},
+			}
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"egm":true}`,
+			}
+
+			domain := &api.Domain{}
+			err := Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("egm requires EGM-backed file memory and does not support hugepages"))
+		})
+
+		It("should reject hugepages for Grace EGM with vcmdq", func() {
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			vmi.Spec.Domain.Memory = &v1.Memory{
+				Hugepages: &v1.Hugepages{},
+			}
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"vcmdq":true,"egm":true}`,
+			}
+
+			domain := &api.Domain{}
+			err := Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("egm requires EGM-backed file memory and does not support hugepages"))
+		})
+
+		It("should shape domain memory to the total EGM size for 2 GPUs per socket", func() {
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			guestMemory := resource.MustParse("113792Mi")
+			vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"egm":true}`,
+			}
+
+			domain := &api.Domain{
+				Spec: api.DomainSpec{
+					Memory: api.Memory{Value: 32 * 1024 * 1024 * 1024, Unit: "b"},
+					CPU: api.CPU{
+						NUMA: &api.NUMA{
+							Cells: []api.NUMACell{
+								{ID: "0", CPUs: "0-1", Memory: 16777216, Unit: "KiB"},
+								{ID: "1", CPUs: "2-3", Memory: 16777216, Unit: "KiB"},
+								{ID: "2", Memory: 0, Unit: "KiB"},
+								{ID: "3", Memory: 0, Unit: "KiB"},
+							},
+						},
+					},
+					Devices: api.Devices{
+						MemoryDevices: []api.MemoryDevice{
+							{Model: "egm", Target: &api.MemoryTarget{Node: "0", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "0", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "1", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "1", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+						},
+					},
+				},
+			}
+
+			err := configureGraceEGMDomainMemoryLayout(vmi, domain)
+			Expect(err).ToNot(HaveOccurred())
+
+			expectedTotalBytes := uint64(113792) * 1024 * 1024
+			expectedNodeBytes := uint64(56896) * 1024 * 1024
+			Expect(domain.Spec.Memory).To(Equal(api.Memory{Value: expectedTotalBytes, Unit: "b"}))
+			Expect(domain.Spec.CurrentMemory).ToNot(BeNil())
+			Expect(*domain.Spec.CurrentMemory).To(Equal(api.Memory{Value: expectedTotalBytes, Unit: "b"}))
+			Expect(domain.Spec.MaxMemory).ToNot(BeNil())
+			Expect(domain.Spec.MaxMemory.Value).To(Equal(expectedTotalBytes))
+			Expect(domain.Spec.MaxMemory.Unit).To(Equal("b"))
+			Expect(domain.Spec.MaxMemory.Slots).To(BeZero())
+			Expect(domain.Spec.CPU.NUMA.Cells[0].Memory).To(Equal(expectedNodeBytes / 1024))
+			Expect(domain.Spec.CPU.NUMA.Cells[0].Unit).To(Equal("KiB"))
+			Expect(domain.Spec.CPU.NUMA.Cells[1].Memory).To(Equal(expectedNodeBytes / 1024))
+			Expect(domain.Spec.CPU.NUMA.Cells[1].Unit).To(Equal("KiB"))
+		})
+
+		It("should shape domain memory to the total EGM size for 1 GPU per socket", func() {
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			guestMemory := resource.MustParse("227584Mi")
+			vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"egm":true}`,
+			}
+
+			domain := &api.Domain{
+				Spec: api.DomainSpec{
+					Memory: api.Memory{Value: 32 * 1024 * 1024 * 1024, Unit: "b"},
+					CPU: api.CPU{
+						NUMA: &api.NUMA{
+							Cells: []api.NUMACell{
+								{ID: "0", CPUs: "0", Memory: 1, Unit: "KiB"},
+								{ID: "1", CPUs: "1", Memory: 1, Unit: "KiB"},
+								{ID: "2", CPUs: "2", Memory: 1, Unit: "KiB"},
+								{ID: "3", CPUs: "3", Memory: 1, Unit: "KiB"},
+								{ID: "4", Memory: 0, Unit: "KiB"},
+							},
+						},
+					},
+					Devices: api.Devices{
+						MemoryDevices: []api.MemoryDevice{
+							{Model: "egm", Target: &api.MemoryTarget{Node: "0", Size: api.Memory{Value: 56896, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "1", Size: api.Memory{Value: 56896, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "2", Size: api.Memory{Value: 56896, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "3", Size: api.Memory{Value: 56896, Unit: "MiB"}}},
+						},
+					},
+				},
+			}
+
+			err := configureGraceEGMDomainMemoryLayout(vmi, domain)
+			Expect(err).ToNot(HaveOccurred())
+
+			expectedTotalBytes := uint64(227584) * 1024 * 1024
+			expectedNodeBytes := uint64(56896) * 1024 * 1024
+			Expect(domain.Spec.Memory).To(Equal(api.Memory{Value: expectedTotalBytes, Unit: "b"}))
+			Expect(domain.Spec.CurrentMemory).ToNot(BeNil())
+			Expect(*domain.Spec.CurrentMemory).To(Equal(api.Memory{Value: expectedTotalBytes, Unit: "b"}))
+			Expect(domain.Spec.MaxMemory).ToNot(BeNil())
+			Expect(domain.Spec.MaxMemory.Value).To(Equal(expectedTotalBytes))
+			Expect(domain.Spec.MaxMemory.Unit).To(Equal("b"))
+			Expect(domain.Spec.MaxMemory.Slots).To(BeZero())
+			for i := 0; i < 4; i++ {
+				Expect(domain.Spec.CPU.NUMA.Cells[i].Memory).To(Equal(expectedNodeBytes / 1024))
+				Expect(domain.Spec.CPU.NUMA.Cells[i].Unit).To(Equal("KiB"))
+			}
+		})
+
+		It("should reject EGM when guest memory does not match the total EGM size", func() {
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			guestMemory := resource.MustParse("32Gi")
+			vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+			vmi.Annotations = map[string]string{
+				v1.GraceVirtualizationAnnotation: `{"hostDevices":true,"smmuv3":true,"egm":true}`,
+			}
+
+			domain := &api.Domain{
+				Spec: api.DomainSpec{
+					Memory: api.Memory{Value: 32 * 1024 * 1024 * 1024, Unit: "b"},
+					CPU: api.CPU{
+						NUMA: &api.NUMA{
+							Cells: []api.NUMACell{
+								{ID: "0", CPUs: "0-1", Memory: 16777216, Unit: "KiB"},
+								{ID: "1", CPUs: "2-3", Memory: 16777216, Unit: "KiB"},
+							},
+						},
+					},
+					Devices: api.Devices{
+						MemoryDevices: []api.MemoryDevice{
+							{Model: "egm", Target: &api.MemoryTarget{Node: "0", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "0", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "1", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+							{Model: "egm", Target: &api.MemoryTarget{Node: "1", Size: api.Memory{Value: 28448, Unit: "MiB"}}},
+						},
+					},
+				},
+			}
+
+			err := configureGraceEGMDomainMemoryLayout(vmi, domain)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("egm requires guest memory to match the total host EGM size"))
+		})
+
 		It("should use guest memory instead of requested memory if present", func() {
 			guestMemory := resource.MustParse("123Mi")
 			vmi.Spec.Domain.Memory = &v1.Memory{
@@ -4128,6 +4311,22 @@ var _ = Describe("SetDriverCacheMode", func() {
 		Entry("'writethrough' without direct io", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckFalse),
 		Entry("'writethrough' on error", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckError),
 	)
+
+	It("should use block device direct IO checks for block-backed disks", func() {
+		disk := &api.Disk{
+			Driver: &api.DiskDriver{},
+			Source: api.DiskSource{
+				Dev: "/dev/rootdisk",
+			},
+		}
+
+		mockDirectIOChecker.EXPECT().CheckBlockDevice("/dev/rootdisk").Return(false, nil)
+		mockDirectIOChecker.EXPECT().CheckFile(gomock.Any()).Times(0)
+
+		err := SetDriverCacheMode(disk, mockDirectIOChecker)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(disk.Driver.Cache).To(Equal(string(v1.CacheWriteThrough)))
+	})
 })
 
 func diskToDiskXML(arch string, disk *v1.Disk) string {

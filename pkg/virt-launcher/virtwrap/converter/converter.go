@@ -26,6 +26,7 @@ package converter
 */
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -85,6 +86,137 @@ type EFIConfiguration struct {
 	EFICode      string
 	EFIVars      string
 	SecureLoader bool
+}
+
+type graceVirtualizationConfig struct {
+	EGM   *bool `json:"egm,omitempty"`
+	VCMDQ *bool `json:"vcmdq,omitempty"`
+}
+
+func getGraceVirtualizationConfig(vmi *v1.VirtualMachineInstance) *graceVirtualizationConfig {
+	if vmi == nil || len(vmi.Annotations) == 0 {
+		return nil
+	}
+
+	rawConfig, exists := vmi.Annotations[v1.GraceVirtualizationAnnotation]
+	if !exists || rawConfig == "" {
+		return nil
+	}
+
+	cfg := &graceVirtualizationConfig{}
+	if err := json.Unmarshal([]byte(rawConfig), cfg); err != nil {
+		return nil
+	}
+
+	return cfg
+}
+
+func configureGraceEGMFileBackedMemory(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
+	cfg := getGraceVirtualizationConfig(vmi)
+	egmEnabled := cfg != nil && cfg.EGM != nil && *cfg.EGM
+	if !egmEnabled {
+		return nil
+	}
+
+	hasHugepages := vmi.Spec.Domain.Memory != nil && vmi.Spec.Domain.Memory.Hugepages != nil
+	if hasHugepages {
+		return fmt.Errorf("egm requires EGM-backed file memory and does not support hugepages")
+	}
+
+	if domain.Spec.MemoryBacking == nil {
+		domain.Spec.MemoryBacking = &api.MemoryBacking{}
+	}
+
+	domain.Spec.MemoryBacking.HugePages = nil
+	domain.Spec.MemoryBacking.NoSharePages = nil
+	domain.Spec.MemoryBacking.Source = &api.MemoryBackingSource{Type: "file"}
+	domain.Spec.MemoryBacking.Access = &api.MemoryBackingAccess{Mode: "shared"}
+	domain.Spec.MemoryBacking.Allocation = &api.MemoryAllocation{Mode: api.MemoryAllocationModeImmediate}
+
+	return nil
+}
+
+func configureGraceEGMDomainMemoryLayout(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
+	cfg := getGraceVirtualizationConfig(vmi)
+	egmEnabled := cfg != nil && cfg.EGM != nil && *cfg.EGM
+	if !egmEnabled {
+		return nil
+	}
+	if domain == nil {
+		return fmt.Errorf("domain is nil")
+	}
+
+	totalMemoryBytes := uint64(0)
+	memoryByGuestNUMANode := make(map[string]uint64)
+	egmDeviceCount := 0
+
+	for _, md := range domain.Spec.Devices.MemoryDevices {
+		if md.Model != "egm" || md.Target == nil {
+			continue
+		}
+
+		sizeBytes, err := domainMemoryToBytes(md.Target.Size)
+		if err != nil {
+			return err
+		}
+		totalMemoryBytes += sizeBytes
+		memoryByGuestNUMANode[md.Target.Node] += sizeBytes
+		egmDeviceCount++
+	}
+
+	if egmDeviceCount == 0 {
+		return nil
+	}
+
+	configuredMemory, err := vcpu.QuantityToByte(*vcpu.GetVirtualMemory(vmi))
+	if err != nil {
+		return err
+	}
+	if configuredMemory.Value != totalMemoryBytes {
+		return fmt.Errorf("egm requires guest memory to match the total host EGM size for the selected GPUs: configured %d bytes, expected %d bytes",
+			configuredMemory.Value, totalMemoryBytes)
+	}
+
+	totalMemory := api.Memory{Value: totalMemoryBytes, Unit: "b"}
+	domain.Spec.Memory = totalMemory
+	domain.Spec.CurrentMemory = &api.Memory{Value: totalMemoryBytes, Unit: "b"}
+	domain.Spec.MaxMemory = &api.MaxMemory{Value: totalMemoryBytes, Unit: "b"}
+
+	if domain.Spec.CPU.NUMA != nil {
+		for i := range domain.Spec.CPU.NUMA.Cells {
+			cell := &domain.Spec.CPU.NUMA.Cells[i]
+			bytesForNode, exists := memoryByGuestNUMANode[cell.ID]
+			if !exists {
+				continue
+			}
+
+			if bytesForNode%1024 != 0 {
+				return fmt.Errorf("egm memory for guest NUMA node %s must align to KiB, got %d bytes", cell.ID, bytesForNode)
+			}
+
+			cell.Memory = bytesForNode / 1024
+			cell.Unit = "KiB"
+		}
+	}
+
+	return nil
+}
+
+func domainMemoryToBytes(memory api.Memory) (uint64, error) {
+	switch memory.Unit {
+	case "", "b":
+		return memory.Value, nil
+	case "KiB":
+		return memory.Value * 1024, nil
+	case "MiB":
+		return memory.Value * 1024 * 1024, nil
+	case "GiB":
+		return memory.Value * 1024 * 1024 * 1024, nil
+	case "TiB":
+		return memory.Value * 1024 * 1024 * 1024 * 1024, nil
+	default:
+		return 0, fmt.Errorf("unsupported memory unit %q", memory.Unit)
+	}
 }
 
 type ConverterContext struct {
@@ -440,6 +572,7 @@ func SetDriverCacheMode(disk *api.Disk, directIOChecker DirectIOChecker) error {
 		path = disk.Source.File
 	case disk.Source.Dev != "":
 		path = disk.Source.Dev
+		isBlockDev = true
 	// handle empty cdrom
 	case disk.Device == "cdrom":
 		return nil
@@ -1717,6 +1850,9 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 			}
 		}
 	}
+	if err := configureGraceEGMFileBackedMemory(vmi, domain); err != nil {
+		return err
+	}
 
 	volumeIndices := map[string]int{}
 	volumes := map[string]*v1.Volume{}
@@ -1963,7 +2099,12 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 	// Apply host device NUMA topology based on VMI spec and node topology
 	// Only apply if PCINUMAAwareTopology feature gate is enabled
 	if c.PCINUMAAwareTopologyEnabled {
-		hostdevice.ApplyNUMAHostDeviceTopology(vmi, domain)
+		if err := hostdevice.ApplyNUMAHostDeviceTopology(vmi, domain); err != nil {
+			return err
+		}
+	}
+	if err := configureGraceEGMDomainMemoryLayout(vmi, domain); err != nil {
+		return err
 	}
 
 	if vmi.Spec.Domain.CPU == nil || vmi.Spec.Domain.CPU.Model == "" {
