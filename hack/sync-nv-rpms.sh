@@ -168,7 +168,7 @@ find_old_names() {
         # Check for existing el10nv entries first (from a previous sync),
         # then fall back to base el10 entries (first-time sync).
         local old_name
-        old_name=$(grep -oP "name = \"\K${subpkg}-\d+__[^\"]*\.el10nv\.${arch}" "${WORKSPACE_FILE}" | head -1 || true)
+        old_name=$(grep -oP "name = \"\K${subpkg}-\d+__[^\"]*\.el10nv[^\"]*\.${arch}" "${WORKSPACE_FILE}" | head -1 || true)
         if [[ -z "${old_name}" ]]; then
             old_name=$(grep -oP "name = \"\K${subpkg}-\d+__[^\"]*\.el10\.${arch}" "${WORKSPACE_FILE}" | head -1 || true)
         fi
@@ -220,6 +220,16 @@ download_subpackages() {
             local rpm_filename="${subpkg}-${version}-${release}.${arch}.rpm"
             local rpm_url="${KOJI_BASE_URL}/${source_pkg}/${version}/${release}/${arch}/${rpm_filename}"
             local bazel_name="${subpkg}-${epoch}__${version}-${release}.${arch}"
+
+            local key="${subpkg}:${arch}"
+            NEW_NAMES["${key}"]="${bazel_name}"
+
+            # Skip download if the version/release hasn't changed.
+            if [[ "${OLD_NAMES[${key}]:-}" == "${bazel_name}" ]]; then
+                echo "  ${rpm_filename} (unchanged, skipping download)"
+                continue
+            fi
+
             local tmpfile="${TMPDIR}/${rpm_filename}"
 
             echo "  ${rpm_filename}"
@@ -228,9 +238,7 @@ download_subpackages() {
             sha256=$(sha256sum "${tmpfile}" | awk '{print $1}')
             rm -f "${tmpfile}"
 
-            local key="${subpkg}:${arch}"
             SHA256S["${key}"]="${sha256}"
-            NEW_NAMES["${key}"]="${bazel_name}"
             RPM_URLS["${key}"]="${rpm_url}"
         done
     done
@@ -256,6 +264,22 @@ generate_insert_file() {
     for entry in "${subpkgs[@]}"; do
         local subpkg="${entry%%:*}"
         local arches="${entry##*:}"
+
+        # Skip subpackages whose version/release hasn't changed to avoid
+        # removing existing cached builddeps URLs from their rpm() blocks.
+        local changed=false
+        IFS=',' read -ra check_arches <<<"${arches}"
+        for arch in "${check_arches[@]}"; do
+            local key="${subpkg}:${arch}"
+            if [[ "${OLD_NAMES[${key}]:-}" != "${NEW_NAMES[${key}]:-}" ]]; then
+                changed=true
+                break
+            fi
+        done
+        if ! ${changed}; then
+            echo "  ${subpkg}: unchanged, skipping"
+            continue
+        fi
 
         all_subpkg_names+=("${subpkg}")
 
