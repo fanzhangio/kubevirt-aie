@@ -1094,7 +1094,6 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		FreePageReporting:         isFreePageReportingEnabled(false, vmi),
 		SerialConsoleLog:          isSerialConsoleLogEnabled(false, vmi),
 		HypervisorName:            l.hypervisorName,
-		IommuPCI:                  iommupci.NewIommuPCI(runtime.GOARCH),
 	}
 
 	if options != nil {
@@ -1133,6 +1132,15 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 			} else {
 				l.iommuFD = fd
 				logger.V(3).Infof("Received IOMMUFD file descriptor: %d", fd)
+			}
+		}
+
+		// We need the pre-configured FD for iommufd usage.
+		if l.iommuFD >= 0 {
+			c.IommuPCI = iommupci.NewIommuPCI(runtime.GOARCH)
+		} else {
+			c.IommuPCI = &iommupci.IommuPCI{
+				IommufdEnabled: pointer.P(false),
 			}
 		}
 
