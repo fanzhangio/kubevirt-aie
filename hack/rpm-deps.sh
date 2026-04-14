@@ -18,6 +18,43 @@ SWTPM_VERSION=${SWTPM_VERSION:-0:0.8.0-2.el9}
 SINGLE_ARCH=${SINGLE_ARCH:-""}
 BASESYSTEM=${BASESYSTEM:-"centos-stream-release"}
 
+# ---------------------------------------------------------------------------
+# Per-architecture RPM version overrides
+#
+# Hardware-enablement builds may need architecture-specific builds of core
+# packages (e.g. vendor-patched libvirt/QEMU on ARM platforms).
+# Set ARCH_OVERRIDES to a shell script that exports per-arch variables, or
+# pass them directly as environment variables.  Supported variables (aarch64
+# shown; the same pattern applies to any architecture):
+#
+#   LIBVIRT_VERSION_AARCH64       - libvirt NEVRA override
+#   QEMU_VERSION_AARCH64          - QEMU NEVRA override
+#   QEMU_LAYOUT_AARCH64           - "split" (default) or "bundle"
+#   QEMU_BUNDLE_VERSION_AARCH64   - required when layout is "bundle"
+# ---------------------------------------------------------------------------
+ARCH_OVERRIDES=${ARCH_OVERRIDES:-""}
+if [ -n "${ARCH_OVERRIDES}" ] && [ -f "${ARCH_OVERRIDES}" ]; then
+    # shellcheck disable=SC1090
+    source "${ARCH_OVERRIDES}"
+fi
+
+resolve_arch_version() {
+    local var_prefix=$1 arch_upper=$2 default=$3
+    local var_name="${var_prefix}_${arch_upper}"
+    echo "${!var_name:-${default}}"
+}
+
+LIBVIRT_VERSION_EFF_AARCH64=$(resolve_arch_version LIBVIRT_VERSION AARCH64 "${LIBVIRT_VERSION}")
+QEMU_VERSION_EFF_AARCH64=$(resolve_arch_version QEMU_VERSION AARCH64 "${QEMU_VERSION}")
+QEMU_LAYOUT_AARCH64=${QEMU_LAYOUT_AARCH64:-split}
+
+if [ "${QEMU_LAYOUT_AARCH64}" = "bundle" ]; then
+    if [ -z "${QEMU_BUNDLE_VERSION_AARCH64:-}" ]; then
+        echo "error: QEMU_BUNDLE_VERSION_AARCH64 must be set when QEMU_LAYOUT_AARCH64=bundle" >&2
+        exit 1
+    fi
+fi
+
 bazeldnf_repos="--repofile rpm/repo.yaml"
 if [ "${CUSTOM_REPO}" ]; then
     bazeldnf_repos="--repofile ${CUSTOM_REPO} ${bazeldnf_repos}"
@@ -102,12 +139,6 @@ launcherbase_x86_64="
   qemu-kvm-device-usb-redirect-${QEMU_VERSION}
   seabios-${SEABIOS_VERSION}
 "
-launcherbase_aarch64="
-  edk2-aarch64-${EDK2_VERSION}
-  qemu-kvm-device-usb-redirect-${QEMU_VERSION}
-  qemu-kvm-device-display-virtio-gpu-${QEMU_VERSION}
-  qemu-kvm-device-display-virtio-gpu-pci-${QEMU_VERSION}
-"
 launcherbase_s390x="
   qemu-kvm-device-display-virtio-gpu-${QEMU_VERSION}
   qemu-kvm-device-display-virtio-gpu-ccw-${QEMU_VERSION}
@@ -169,6 +200,79 @@ pr_helper="
 
 sidecar_shim="
     python3
+"
+
+# ---------------------------------------------------------------------------
+# aarch64 per-arch package lists
+#
+# These use the effective per-arch versions resolved above and handle the
+# "bundle" QEMU layout where a single qemu-kvm package replaces the
+# individual qemu-kvm-* subpackages.
+# ---------------------------------------------------------------------------
+if [ "${QEMU_LAYOUT_AARCH64}" = "bundle" ]; then
+    _aarch64_qemu_bundle="qemu-kvm-${QEMU_BUNDLE_VERSION_AARCH64}"
+
+    testimage_main_aarch64="
+      device-mapper
+      e2fsprogs
+      iputils
+      nmap-ncat
+      procps-ng
+      ${_aarch64_qemu_bundle}
+      sevctl
+      tar
+      targetcli
+      util-linux
+      which
+    "
+    launcherbase_main_aarch64="
+      libvirt-client-${LIBVIRT_VERSION_EFF_AARCH64}
+      libvirt-daemon-driver-qemu-${LIBVIRT_VERSION_EFF_AARCH64}
+      passt-${PASST_VERSION}
+      ${_aarch64_qemu_bundle}
+      swtpm-tools-${SWTPM_VERSION}
+    "
+    launcherbase_aarch64="
+      edk2-aarch64-${EDK2_VERSION}
+    "
+    handlerbase_main_aarch64="${_aarch64_qemu_bundle}"
+    aarch64_ignore_qemu_meta="--force-ignore-with-dependencies ^qemu-kvm-[0-9]"
+else
+    testimage_main_aarch64="
+      device-mapper
+      e2fsprogs
+      iputils
+      nmap-ncat
+      procps-ng
+      qemu-img-${QEMU_VERSION_EFF_AARCH64}
+      sevctl
+      tar
+      targetcli
+      util-linux
+      which
+    "
+    launcherbase_main_aarch64="
+      libvirt-client-${LIBVIRT_VERSION_EFF_AARCH64}
+      libvirt-daemon-driver-qemu-${LIBVIRT_VERSION_EFF_AARCH64}
+      passt-${PASST_VERSION}
+      qemu-kvm-core-${QEMU_VERSION_EFF_AARCH64}
+      qemu-kvm-device-usb-host-${QEMU_VERSION_EFF_AARCH64}
+      swtpm-tools-${SWTPM_VERSION}
+    "
+    launcherbase_aarch64="
+      edk2-aarch64-${EDK2_VERSION}
+      qemu-kvm-device-usb-redirect-${QEMU_VERSION_EFF_AARCH64}
+      qemu-kvm-device-display-virtio-gpu-${QEMU_VERSION_EFF_AARCH64}
+      qemu-kvm-device-display-virtio-gpu-pci-${QEMU_VERSION_EFF_AARCH64}
+    "
+    handlerbase_main_aarch64="
+      qemu-img-${QEMU_VERSION_EFF_AARCH64}
+    "
+    aarch64_ignore_qemu_meta=""
+fi
+
+libvirtdevel_main_aarch64="
+  libvirt-devel-${LIBVIRT_VERSION_EFF_AARCH64}
 "
 
 # get latest repo data from repo.yaml
@@ -329,7 +433,7 @@ if [ -z "${SINGLE_ARCH}" ] || [ "${SINGLE_ARCH}" == "aarch64" ]; then
         ${bazeldnf_repos} \
         $centos_main \
         $centos_extra \
-        $testimage_main
+        $testimage_main_aarch64
 
     bazel run \
         --config=${ARCHITECTURE} \
@@ -340,7 +444,7 @@ if [ -z "${SINGLE_ARCH}" ] || [ "${SINGLE_ARCH}" == "aarch64" ]; then
         ${bazeldnf_repos} \
         $centos_main \
         $centos_extra \
-        $libvirtdevel_main \
+        $libvirtdevel_main_aarch64 \
         $libvirtdevel_extra
 
     bazel run \
@@ -371,10 +475,11 @@ if [ -z "${SINGLE_ARCH}" ] || [ "${SINGLE_ARCH}" == "aarch64" ]; then
         --basesystem ${BASESYSTEM} \
         --force-ignore-with-dependencies '^mozjs60' \
         --force-ignore-with-dependencies 'python' \
+        ${aarch64_ignore_qemu_meta} \
         ${bazeldnf_repos} \
         $centos_main \
         $centos_extra \
-        $launcherbase_main \
+        $launcherbase_main_aarch64 \
         $launcherbase_aarch64 \
         $launcherbase_extra
 
@@ -389,7 +494,7 @@ if [ -z "${SINGLE_ARCH}" ] || [ "${SINGLE_ARCH}" == "aarch64" ]; then
         ${bazeldnf_repos} \
         $centos_main \
         $centos_extra \
-        $handlerbase_main \
+        $handlerbase_main_aarch64 \
         $handlerbase_extra
 
     bazel run \
