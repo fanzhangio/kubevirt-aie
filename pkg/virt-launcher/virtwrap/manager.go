@@ -1125,13 +1125,15 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		// The device plugin creates a one-shot Unix socket and bind-mounts it
 		// into the container at IOMMUFDSocketPath. If present, we receive the
 		// pre-configured FD via SCM_RIGHTS for later use with libvirt.
-		if _, statErr := os.Stat(IOMMUFDSocketPath); statErr == nil {
-			fd, recvErr := ReceiveIOMMUFD(IOMMUFDSocketPath)
-			if recvErr != nil {
-				logger.Warningf("IOMMUFD socket exists but failed to receive FD: %v", recvErr)
-			} else {
-				l.iommuFD = fd
-				logger.V(3).Infof("Received IOMMUFD file descriptor: %d", fd)
+		if l.iommuFD == -1 {
+			if _, statErr := os.Stat(IOMMUFDSocketPath); statErr == nil {
+				fd, recvErr := ReceiveIOMMUFD(IOMMUFDSocketPath)
+				if recvErr != nil {
+					logger.Warningf("IOMMUFD socket exists but failed to receive FD: %v", recvErr)
+				} else {
+					l.iommuFD = fd
+					logger.V(3).Infof("Received IOMMUFD file descriptor: %d", fd)
+				}
 			}
 		}
 
