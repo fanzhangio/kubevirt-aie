@@ -52,6 +52,12 @@ const (
 
 	egmHostdevAliasPrefix = "hostdev"
 	graceHBMNodeSetBase   = 1
+
+	graceNUMADistanceLocal        = 10
+	graceNUMADistanceSameGPUGroup = 11
+	graceNUMADistanceRemoteNode   = 40
+	graceNUMADistanceLocalToGPU   = 80
+	graceNUMADistanceRemoteToGPU  = 120
 )
 
 var (
@@ -170,6 +176,40 @@ type deviceGroupKey struct {
 	hostNUMANode  int
 	pathKey       string
 	pxbGroup      string
+}
+
+type graceNUMANodeKind int
+
+const (
+	graceNUMANodeTraditional graceNUMANodeKind = iota
+	graceNUMANodeGI
+)
+
+type graceNUMANodeInfo struct {
+	id       int
+	kind     graceNUMANodeKind
+	homeNode int
+	giGroup  string
+}
+
+type graceGPUNodeAssignment struct {
+	bdf           string
+	guestNUMANode int
+	giStartNode   int
+	giEndNode     int
+}
+
+type graceTopologyPlan struct {
+	assignments []graceGPUNodeAssignment
+	byBDF       map[string]graceGPUNodeAssignment
+	orderByBDF  map[string]int
+}
+
+type discoveredDeviceNUMATopology struct {
+	devicesWithNUMA     []deviceNUMAInfo
+	hostNUMANodes       map[int]struct{}
+	unmappedHostNodes   map[int]struct{}
+	allMappingsAccurate bool
 }
 
 type pxbKey struct {
@@ -293,81 +333,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	if graceSMMUv3Enabled && !iommuFDDeviceAvailable {
 		log.Log.Warning("Grace smmuv3 requested but /dev/iommu is unavailable; falling back to smmuv3 accel=off and disabling iommufd hostdev backend")
 	}
-	devicesWithNUMA := make([]deviceNUMAInfo, 0, len(hostDevices))
-	hostNUMANodes := make(map[int]struct{})
-	guestNUMANodes := getGuestNUMANodes(domain)
-	hostToGuestNUMA := getHostToGuestNUMAMap(domain)
-	unmappedHostNodes := make(map[int]struct{})
-	allMappingsAccurate := true
-
-	for i := range hostDevices {
-		dev := &domain.Spec.Devices.HostDevices[i]
-		if dev.Type != api.HostDevicePCI && dev.Type != api.HostDeviceMDev {
-			log.Log.V(1).Infof("skipping host device %d with unsupported type %s", i, dev.Type)
-			continue
-		}
-		bdf, err := resolveHostDevicePCIAddress(dev)
-		if err != nil {
-			log.Log.V(1).Reason(err).Info("unable to resolve host device PCI address for NUMA planning, skipping")
-			continue
-		}
-		numaNode, err := getDeviceNumaNodeIntFunc(bdf)
-		if err != nil || numaNode < 0 {
-			if err != nil {
-				log.Log.V(1).Reason(err).Infof("skipping host device %s - failed to detect NUMA node", bdf)
-			} else {
-				log.Log.V(1).Infof("skipping host device %s - NUMA node not available", bdf)
-			}
-			continue
-		}
-		topologyGroup, err := getDevicePCIProximityGroupFunc(bdf)
-		if err != nil {
-			log.Log.V(1).Reason(err).Infof("using default topology grouping for host device %s (host NUMA %d)", bdf, numaNode)
-			topologyGroup = fmt.Sprintf("numa-%d", numaNode)
-		}
-
-		path, err := getDevicePCIPathHierarchyFunc(bdf)
-		if err != nil {
-			log.Log.V(1).Reason(err).Infof("skipping host device %s - unable to derive PCI hierarchy", bdf)
-			continue
-		}
-		pathKey := ComputePCISwitchGroupKey(path, bdf)
-
-		iommuGroup, iommuPeers, err := getDeviceIOMMUGroupInfoFunc(bdf)
-		if err != nil {
-			log.Log.Reason(err).Warningf("unable to detect IOMMU group for host device %s", bdf)
-		}
-
-		guestNode, mappingAccurate := mapHostToGuestNUMANode(numaNode, guestNUMANodes, hostToGuestNUMA)
-		if !mappingAccurate {
-			unmappedHostNodes[numaNode] = struct{}{}
-			allMappingsAccurate = false
-			log.Log.V(1).Infof("host device %s (host NUMA %d) cannot be matched to a distinct guest NUMA node", bdf, numaNode)
-		} else {
-			log.Log.V(1).Infof("host device %s aligned with guest NUMA node %d", bdf, guestNode)
-		}
-
-		largeMMIO := shouldUseDedicatedPXBForDevice(deviceNUMAInfo{
-			dev: dev,
-			bdf: bdf,
-		}, graceHostDevicesEnabled)
-
-		devicesWithNUMA = append(devicesWithNUMA, deviceNUMAInfo{
-			dev:             dev,
-			hostNUMANode:    numaNode,
-			guestNUMANode:   guestNode,
-			bdf:             bdf,
-			topologyGroup:   topologyGroup,
-			path:            path,
-			pathKey:         pathKey,
-			iommuGroup:      iommuGroup,
-			iommuPeers:      iommuPeers,
-			mappingAccurate: mappingAccurate,
-			dedicatedPXB:    largeMMIO,
-			isolatedPXB:     largeMMIO,
-		})
-		hostNUMANodes[numaNode] = struct{}{}
-	}
+	discoveredTopology := discoverDeviceNUMATopology(domain, graceHostDevicesEnabled)
+	devicesWithNUMA := discoveredTopology.devicesWithNUMA
+	hostNUMANodes := discoveredTopology.hostNUMANodes
 
 	if len(devicesWithNUMA) == 0 {
 		log.Log.V(1).Info("NUMA host device topology not applied: no devices with NUMA affinity detected")
@@ -377,9 +345,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		return nil
 	}
 
-	if !allMappingsAccurate {
+	if !discoveredTopology.allMappingsAccurate {
 		var nodes []string
-		for node := range unmappedHostNodes {
+		for node := range discoveredTopology.unmappedHostNodes {
 			nodes = append(nodes, strconv.Itoa(node))
 		}
 		slices.Sort(nodes)
@@ -480,7 +448,8 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 
 	// Add a default root port for general-purpose device assignment
 	planner.addDefaultRootPort()
-	graceGINodeSetAssignments := buildGraceGINodeSetAssignments(domain, devicesWithNUMA, graceHostDevicesEnabled)
+	graceTopology := buildGraceTopologyPlan(domain, devicesWithNUMA, graceHostDevicesEnabled)
+	applyGraceTopologyPlan(domain, graceTopology)
 
 	for _, key := range groupKeys {
 		infos := grouped[key]
@@ -539,7 +508,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			assignHostDeviceToRootPort(info.dev, rootPort)
 			if graceHostDevicesEnabled {
 				enableIOMMUFD := iommuFDDeviceAvailable && (info.dedicatedPXB || graceSMMUv3Enabled)
-				applyGraceHostDeviceSettings(info.dev, key.guestNUMANode, graceGINodeSetAssignments[info.dev], enableIOMMUFD)
+				applyGraceHostDeviceSettings(info.dev, key.guestNUMANode, graceTopology.nodeSetForBDF(info.bdf), enableIOMMUFD)
 			}
 			log.Log.V(1).Infof("assigned host device %s to host NUMA %d (guest NUMA %d) via controller %d", info.bdf, key.hostNUMANode, key.guestNUMANode, rootPort.controllerIndex)
 		}
@@ -548,11 +517,101 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	applyGraceSMMUv3IOMMUTopology(domain, graceCfg, graceHostDevicesEnabled, iommuFDDeviceAvailable)
 
 	if egmEnabled && graceHostDevicesEnabled {
-		if err := applyEGMMemoryDevices(domain, devicesWithNUMA); err != nil {
+		if err := applyEGMMemoryDevices(domain, devicesWithNUMA, graceTopology); err != nil {
 			return err
 		}
 	}
+	if graceHostDevicesEnabled {
+		applyGraceNUMADistances(domain, graceTopology)
+		sortGraceHostDevicesForSRAT(domain, graceTopology)
+	}
 	return nil
+}
+
+func discoverDeviceNUMATopology(domain *api.Domain, graceHostDevicesEnabled bool) discoveredDeviceNUMATopology {
+	discovered := discoveredDeviceNUMATopology{
+		devicesWithNUMA:     make([]deviceNUMAInfo, 0, len(domain.Spec.Devices.HostDevices)),
+		hostNUMANodes:       make(map[int]struct{}),
+		unmappedHostNodes:   make(map[int]struct{}),
+		allMappingsAccurate: true,
+	}
+	if domain == nil {
+		return discovered
+	}
+
+	guestNUMANodes := getGuestNUMANodes(domain)
+	hostToGuestNUMA := getHostToGuestNUMAMap(domain)
+
+	for i := range domain.Spec.Devices.HostDevices {
+		dev := &domain.Spec.Devices.HostDevices[i]
+		if dev.Type != api.HostDevicePCI && dev.Type != api.HostDeviceMDev {
+			log.Log.V(1).Infof("skipping host device %d with unsupported type %s", i, dev.Type)
+			continue
+		}
+		bdf, err := resolveHostDevicePCIAddress(dev)
+		if err != nil {
+			log.Log.V(1).Reason(err).Info("unable to resolve host device PCI address for NUMA planning, skipping")
+			continue
+		}
+		numaNode, err := getDeviceNumaNodeIntFunc(bdf)
+		if err != nil || numaNode < 0 {
+			if err != nil {
+				log.Log.V(1).Reason(err).Infof("skipping host device %s - failed to detect NUMA node", bdf)
+			} else {
+				log.Log.V(1).Infof("skipping host device %s - NUMA node not available", bdf)
+			}
+			continue
+		}
+		topologyGroup, err := getDevicePCIProximityGroupFunc(bdf)
+		if err != nil {
+			log.Log.V(1).Reason(err).Infof("using default topology grouping for host device %s (host NUMA %d)", bdf, numaNode)
+			topologyGroup = fmt.Sprintf("numa-%d", numaNode)
+		}
+
+		path, err := getDevicePCIPathHierarchyFunc(bdf)
+		if err != nil {
+			log.Log.V(1).Reason(err).Infof("skipping host device %s - unable to derive PCI hierarchy", bdf)
+			continue
+		}
+		pathKey := ComputePCISwitchGroupKey(path, bdf)
+
+		iommuGroup, iommuPeers, err := getDeviceIOMMUGroupInfoFunc(bdf)
+		if err != nil {
+			log.Log.Reason(err).Warningf("unable to detect IOMMU group for host device %s", bdf)
+		}
+
+		guestNode, mappingAccurate := mapHostToGuestNUMANode(numaNode, guestNUMANodes, hostToGuestNUMA)
+		if !mappingAccurate {
+			discovered.unmappedHostNodes[numaNode] = struct{}{}
+			discovered.allMappingsAccurate = false
+			log.Log.V(1).Infof("host device %s (host NUMA %d) cannot be matched to a distinct guest NUMA node", bdf, numaNode)
+		} else {
+			log.Log.V(1).Infof("host device %s aligned with guest NUMA node %d", bdf, guestNode)
+		}
+
+		largeMMIO := shouldUseDedicatedPXBForDevice(deviceNUMAInfo{
+			dev: dev,
+			bdf: bdf,
+		}, graceHostDevicesEnabled)
+
+		discovered.devicesWithNUMA = append(discovered.devicesWithNUMA, deviceNUMAInfo{
+			dev:             dev,
+			hostNUMANode:    numaNode,
+			guestNUMANode:   guestNode,
+			bdf:             bdf,
+			topologyGroup:   topologyGroup,
+			path:            path,
+			pathKey:         pathKey,
+			iommuGroup:      iommuGroup,
+			iommuPeers:      iommuPeers,
+			mappingAccurate: mappingAccurate,
+			dedicatedPXB:    largeMMIO,
+			isolatedPXB:     largeMMIO,
+		})
+		discovered.hostNUMANodes[numaNode] = struct{}{}
+	}
+
+	return discovered
 }
 
 func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
@@ -1507,7 +1566,7 @@ func removeGraceSMMUv3QEMUArgs(domain *api.Domain) {
 //
 // The function also assigns stable user-defined aliases to the GPU hostdevs
 // so that the <memory> pciDev attribute can reference them.
-func applyEGMMemoryDevices(domain *api.Domain, devicesWithNUMA []deviceNUMAInfo) error {
+func applyEGMMemoryDevices(domain *api.Domain, devicesWithNUMA []deviceNUMAInfo, graceTopology graceTopologyPlan) error {
 	const bytesPerMiB = 1024 * 1024
 
 	egmDevices, err := discoverEGMDevicesFunc()
@@ -1534,6 +1593,21 @@ func applyEGMMemoryDevices(domain *api.Domain, devicesWithNUMA []deviceNUMAInfo)
 	}
 
 	slices.SortFunc(gpuDevices, func(a, b deviceNUMAInfo) int {
+		aOrder, aOrdered := graceTopology.orderForBDF(a.bdf)
+		bOrder, bOrdered := graceTopology.orderForBDF(b.bdf)
+		switch {
+		case aOrdered && bOrdered:
+			if aOrder != bOrder {
+				if aOrder < bOrder {
+					return -1
+				}
+				return 1
+			}
+		case aOrdered:
+			return -1
+		case bOrdered:
+			return 1
+		}
 		if a.bdf < b.bdf {
 			return -1
 		}
@@ -1709,10 +1783,36 @@ func applyGraceHostDeviceSettings(dev *api.HostDevice, guestNUMANode int, giNode
 	}
 }
 
-func buildGraceGINodeSetAssignments(domain *api.Domain, devicesWithNUMA []deviceNUMAInfo, graceHostDevicesEnabled bool) map[*api.HostDevice]string {
-	assignments := make(map[*api.HostDevice]string)
+func PrepareGraceGuestNUMATopology(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
+	if vmi == nil || domain == nil {
+		return nil
+	}
+	graceCfg := parseGraceVirtualizationConfig(vmi)
+	graceHostDevicesEnabled := isGraceHostDevicesEnabledForArch(vmi, graceCfg)
+	if !graceHostDevicesEnabled {
+		return nil
+	}
+	if domain.Spec.CPU.NUMA == nil || len(domain.Spec.CPU.NUMA.Cells) == 0 {
+		return fmt.Errorf("grace guest NUMA topology requested before CPU NUMA cells were prepared")
+	}
+
+	discoveredTopology := discoverDeviceNUMATopology(domain, graceHostDevicesEnabled)
+	if len(discoveredTopology.devicesWithNUMA) == 0 {
+		return nil
+	}
+
+	graceTopology := buildGraceTopologyPlan(domain, discoveredTopology.devicesWithNUMA, graceHostDevicesEnabled)
+	applyGraceTopologyPlan(domain, graceTopology)
+	return nil
+}
+
+func buildGraceTopologyPlan(domain *api.Domain, devicesWithNUMA []deviceNUMAInfo, graceHostDevicesEnabled bool) graceTopologyPlan {
+	plan := graceTopologyPlan{
+		byBDF:      map[string]graceGPUNodeAssignment{},
+		orderByBDF: map[string]int{},
+	}
 	if !graceHostDevicesEnabled || domain == nil {
-		return assignments
+		return plan
 	}
 
 	giDevices := make([]deviceNUMAInfo, 0, len(devicesWithNUMA))
@@ -1720,15 +1820,13 @@ func buildGraceGINodeSetAssignments(domain *api.Domain, devicesWithNUMA []device
 		if info.dev == nil || info.dev.Type != api.HostDevicePCI {
 			continue
 		}
-		// Grace guidance reserves eight dedicated GI NUMA nodes for each GPU.
-		// We treat dedicated PXB devices (large MMIO GPUs) as GI consumers.
 		if !info.dedicatedPXB {
 			continue
 		}
 		giDevices = append(giDevices, info)
 	}
 	if len(giDevices) == 0 {
-		return assignments
+		return plan
 	}
 
 	slices.SortFunc(giDevices, func(a, b deviceNUMAInfo) int {
@@ -1747,36 +1845,87 @@ func buildGraceGINodeSetAssignments(domain *api.Domain, devicesWithNUMA []device
 		return 1
 	})
 
-	nextNode := nextAvailableGuestNUMACellID(domain)
-	if nextNode < graceHBMNodeSetBase {
-		nextNode = graceHBMNodeSetBase
-	}
-	for _, info := range giDevices {
+	nextNode := nextGraceGINodeBase(domain)
+
+	for i, info := range giDevices {
 		start := nextNode
 		end := start + graceHBMNodesPerGPU - 1
-		ensureGuestNUMACellRange(domain, start, end)
-		assignments[info.dev] = fmt.Sprintf("%d-%d", start, end)
-		log.Log.V(1).Infof("Grace GI: assigned host device %s to dedicated guest NUMA GI nodes %d-%d", info.bdf, start, end)
+		assignment := graceGPUNodeAssignment{
+			bdf:           info.bdf,
+			guestNUMANode: info.guestNUMANode,
+			giStartNode:   start,
+			giEndNode:     end,
+		}
+		plan.assignments = append(plan.assignments, assignment)
+		plan.byBDF[assignment.bdf] = assignment
+		plan.orderByBDF[assignment.bdf] = i
 		nextNode = end + 1
 	}
-	return assignments
+	return plan
 }
 
-func nextAvailableGuestNUMACellID(domain *api.Domain) int {
-	if domain == nil || domain.Spec.CPU.NUMA == nil {
-		return 0
+func applyGraceTopologyPlan(domain *api.Domain, plan graceTopologyPlan) {
+	if domain == nil {
+		return
 	}
-	maxID := -1
+	for _, assignment := range plan.assignments {
+		ensureGuestNUMACellRange(domain, assignment.giStartNode, assignment.giEndNode)
+		log.Log.V(1).Infof("Grace GI: assigned host device %s to dedicated guest NUMA GI nodes %d-%d",
+			assignment.bdf, assignment.giStartNode, assignment.giEndNode)
+	}
+}
+
+func (p graceTopologyPlan) nodeSetForBDF(bdf string) string {
+	assignment, ok := p.byBDF[bdf]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%d-%d", assignment.giStartNode, assignment.giEndNode)
+}
+
+func (p graceTopologyPlan) orderForBDF(bdf string) (int, bool) {
+	order, ok := p.orderByBDF[bdf]
+	return order, ok
+}
+
+func nextGraceGINodeBase(domain *api.Domain) int {
+	if domain == nil || domain.Spec.CPU.NUMA == nil {
+		return graceHBMNodeSetBase
+	}
+	traditionalIDs := make(map[int]struct{})
+	if domain.Spec.NUMATune != nil {
+		for _, memNode := range domain.Spec.NUMATune.MemNodes {
+			traditionalIDs[int(memNode.CellID)] = struct{}{}
+		}
+	}
+	maxTraditionalID := -1
 	for _, cell := range domain.Spec.CPU.NUMA.Cells {
 		id, err := strconv.Atoi(strings.TrimSpace(cell.ID))
 		if err != nil {
 			continue
 		}
-		if id > maxID {
-			maxID = id
+		if !isTraditionalNUMACell(cell, traditionalIDs) {
+			continue
+		}
+		if id > maxTraditionalID {
+			maxTraditionalID = id
 		}
 	}
-	return maxID + 1
+	nextNode := maxTraditionalID + 1
+	if nextNode < graceHBMNodeSetBase {
+		nextNode = graceHBMNodeSetBase
+	}
+	return nextNode
+}
+
+func isTraditionalNUMACell(cell api.NUMACell, traditionalIDs map[int]struct{}) bool {
+	id, err := strconv.Atoi(strings.TrimSpace(cell.ID))
+	if err == nil {
+		if _, ok := traditionalIDs[id]; ok {
+			return true
+		}
+	}
+	return strings.TrimSpace(cell.CPUs) != "" || cell.Memory > 0
 }
 
 func ensureGuestNUMACellRange(domain *api.Domain, start, end int) {
@@ -1830,6 +1979,139 @@ func ensureGuestNUMACellRange(domain *api.Domain, start, end int) {
 			return 1
 		}
 	})
+}
+
+func applyGraceNUMADistances(domain *api.Domain, graceTopology graceTopologyPlan) {
+	if domain == nil || domain.Spec.CPU.NUMA == nil || len(domain.Spec.CPU.NUMA.Cells) == 0 || len(graceTopology.assignments) == 0 {
+		return
+	}
+
+	nodeInfos := make(map[int]graceNUMANodeInfo, len(domain.Spec.CPU.NUMA.Cells))
+	nodeIDs := make([]int, 0, len(domain.Spec.CPU.NUMA.Cells))
+	for _, cell := range domain.Spec.CPU.NUMA.Cells {
+		id, err := strconv.Atoi(strings.TrimSpace(cell.ID))
+		if err != nil {
+			continue
+		}
+		nodeIDs = append(nodeIDs, id)
+		nodeInfos[id] = graceNUMANodeInfo{
+			id:       id,
+			kind:     graceNUMANodeTraditional,
+			homeNode: id,
+		}
+	}
+	if len(nodeIDs) == 0 {
+		return
+	}
+	slices.Sort(nodeIDs)
+
+	for _, assignment := range graceTopology.assignments {
+		nodeSet := fmt.Sprintf("%d-%d", assignment.giStartNode, assignment.giEndNode)
+		for nodeID := assignment.giStartNode; nodeID <= assignment.giEndNode; nodeID++ {
+			nodeInfos[nodeID] = graceNUMANodeInfo{
+				id:       nodeID,
+				kind:     graceNUMANodeGI,
+				homeNode: assignment.guestNUMANode,
+				giGroup:  nodeSet,
+			}
+		}
+	}
+
+	for i := range domain.Spec.CPU.NUMA.Cells {
+		id, err := strconv.Atoi(strings.TrimSpace(domain.Spec.CPU.NUMA.Cells[i].ID))
+		if err != nil {
+			continue
+		}
+
+		srcInfo, ok := nodeInfos[id]
+		if !ok {
+			srcInfo = graceNUMANodeInfo{id: id, kind: graceNUMANodeTraditional, homeNode: id}
+		}
+
+		siblings := make([]api.NUMACellSibling, 0, len(nodeIDs))
+		for _, dstID := range nodeIDs {
+			dstInfo, ok := nodeInfos[dstID]
+			if !ok {
+				dstInfo = graceNUMANodeInfo{id: dstID, kind: graceNUMANodeTraditional, homeNode: dstID}
+			}
+			siblings = append(siblings, api.NUMACellSibling{
+				ID:    strconv.Itoa(dstID),
+				Value: graceNUMADistanceValue(srcInfo, dstInfo),
+			})
+		}
+		domain.Spec.CPU.NUMA.Cells[i].Distances = &api.NUMACellDistances{Siblings: siblings}
+	}
+}
+
+func sortGraceHostDevicesForSRAT(domain *api.Domain, graceTopology graceTopologyPlan) {
+	if domain == nil || len(domain.Spec.Devices.HostDevices) < 2 {
+		return
+	}
+
+	slices.SortStableFunc(domain.Spec.Devices.HostDevices, func(a, b api.HostDevice) int {
+		aAddr, errA := resolveHostDevicePCIAddress(&a)
+		bAddr, errB := resolveHostDevicePCIAddress(&b)
+		aOrder, aOrdered := graceTopology.orderForBDF(aAddr)
+		bOrder, bOrdered := graceTopology.orderForBDF(bAddr)
+		switch {
+		case aOrdered && bOrdered:
+			if aOrder != bOrder {
+				if aOrder < bOrder {
+					return -1
+				}
+				return 1
+			}
+		case aOrdered:
+			return -1
+		case bOrdered:
+			return 1
+		}
+
+		switch {
+		case errA == nil && errB == nil:
+			if aAddr == bAddr {
+				return 0
+			}
+			if aAddr < bAddr {
+				return -1
+			}
+			return 1
+		case errA == nil:
+			return -1
+		case errB == nil:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
+
+func graceNUMADistanceValue(src, dst graceNUMANodeInfo) uint64 {
+	if src.id == dst.id {
+		return graceNUMADistanceLocal
+	}
+
+	switch {
+	case src.kind == graceNUMANodeTraditional && dst.kind == graceNUMANodeTraditional:
+		return graceNUMADistanceRemoteNode
+	case src.kind == graceNUMANodeGI && dst.kind == graceNUMANodeGI:
+		if src.giGroup != "" && src.giGroup == dst.giGroup {
+			return graceNUMADistanceSameGPUGroup
+		}
+		return graceNUMADistanceRemoteNode
+	case src.kind == graceNUMANodeTraditional && dst.kind == graceNUMANodeGI:
+		if src.homeNode == dst.homeNode {
+			return graceNUMADistanceLocalToGPU
+		}
+		return graceNUMADistanceRemoteToGPU
+	case src.kind == graceNUMANodeGI && dst.kind == graceNUMANodeTraditional:
+		if src.homeNode == dst.homeNode {
+			return graceNUMADistanceLocalToGPU
+		}
+		return graceNUMADistanceRemoteToGPU
+	default:
+		return graceNUMADistanceRemoteNode
+	}
 }
 
 func shouldUseDedicatedPXBForDevice(info deviceNUMAInfo, graceHostDevicesEnabled bool) bool {

@@ -1,8 +1,12 @@
 package vcpu
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -361,22 +365,33 @@ func isNumaPassthrough(vmi *v12.VirtualMachineInstance) bool {
 }
 
 type graceVirtualizationConfig struct {
-	EGM *bool `json:"egm,omitempty"`
+	HostDevices *bool `json:"hostDevices,omitempty"`
+	EGM         *bool `json:"egm,omitempty"`
 }
 
 func isGraceEGMEnabled(vmi *v12.VirtualMachineInstance) bool {
+	cfg := getGraceVirtualizationConfig(vmi)
+	return cfg != nil && cfg.EGM != nil && *cfg.EGM
+}
+
+func isGraceHostDevicesEnabled(vmi *v12.VirtualMachineInstance) bool {
+	cfg := getGraceVirtualizationConfig(vmi)
+	return cfg != nil && cfg.HostDevices != nil && *cfg.HostDevices
+}
+
+func getGraceVirtualizationConfig(vmi *v12.VirtualMachineInstance) *graceVirtualizationConfig {
 	if vmi == nil || len(vmi.Annotations) == 0 {
-		return false
+		return nil
 	}
 	raw, exists := vmi.Annotations[v12.GraceVirtualizationAnnotation]
 	if !exists || strings.TrimSpace(raw) == "" {
-		return false
+		return nil
 	}
 	cfg := &graceVirtualizationConfig{}
 	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		return false
+		return nil
 	}
-	return cfg.EGM != nil && *cfg.EGM
+	return cfg
 }
 
 func requiresStrictNUMAAffinity(vmi *v12.VirtualMachineInstance) bool {
@@ -548,6 +563,10 @@ func AdjustDomainForTopologyAndCPUSet(domain *api.Domain, vmi *v12.VirtualMachin
 			log.Log.Reason(err).Error("failed to calculate Grace EGM NUMA topology.")
 			return err
 		}
+		if err := prepareGraceGuestNUMATopology(vmi, domain); err != nil {
+			log.Log.Reason(err).Error("failed to prepare Grace guest GI NUMA topology.")
+			return err
+		}
 	} else if isNumaPassthrough(vmi) {
 		if err := numaMapping(vmi, &domain.Spec, topology); err != nil {
 			log.Log.Reason(err).Error("failed to calculate passed through NUMA topology.")
@@ -608,6 +627,288 @@ func GetVirtualMemory(vmi *v12.VirtualMachineInstance) *resource.Quantity {
 
 	// Otherwise, take memory from the requested memory
 	return &reqMemory
+}
+
+const (
+	graceLargeMMIOPXBIsolationThresholdGiB = uint64(128)
+	graceLargeMMIOPXBIsolationThreshold    = graceLargeMMIOPXBIsolationThresholdGiB << 30
+	graceHBMNodesPerGPU                    = 8
+	graceHBMNodeSetBase                    = 1
+	graceIOResourceMemFlag                 = 0x00000200
+)
+
+type graceGPUNodeAssignment struct {
+	hostBDF       string
+	guestNUMANode int
+	giStartNodeID int
+	giEndNodeID   int
+}
+
+func prepareGraceGuestNUMATopology(vmi *v12.VirtualMachineInstance, domain *api.Domain) error {
+	if !isGraceHostDevicesEnabled(vmi) || domain == nil {
+		return nil
+	}
+	if domain.Spec.CPU.NUMA == nil || len(domain.Spec.CPU.NUMA.Cells) == 0 {
+		return fmt.Errorf("grace guest GI topology requested before CPU NUMA cells were prepared")
+	}
+
+	assignments, err := buildGraceGPUNodeAssignments(domain)
+	if err != nil {
+		return err
+	}
+	for _, assignment := range assignments {
+		ensureGraceGuestNUMACellRange(domain, assignment.giStartNodeID, assignment.giEndNodeID)
+	}
+	return nil
+}
+
+func buildGraceGPUNodeAssignments(domain *api.Domain) ([]graceGPUNodeAssignment, error) {
+	if domain == nil {
+		return nil, nil
+	}
+
+	guestNUMANodes := getGuestNUMANodes(domain)
+	hostToGuestNUMA := getHostToGuestNUMAMap(domain)
+	giDevices := make([]graceGPUNodeAssignment, 0, len(domain.Spec.Devices.HostDevices))
+
+	for i := range domain.Spec.Devices.HostDevices {
+		dev := &domain.Spec.Devices.HostDevices[i]
+		if dev.Type != api.HostDevicePCI {
+			continue
+		}
+		bdf, err := resolveGraceHostDevicePCIAddress(dev)
+		if err != nil {
+			continue
+		}
+		totalMMIO, err := getGraceDevicePCITotalMMIOSize(bdf)
+		if err != nil || totalMMIO < graceLargeMMIOPXBIsolationThreshold {
+			continue
+		}
+		hostNUMANode, err := hardware.GetDeviceNumaNodeInt(bdf)
+		if err != nil || hostNUMANode < 0 {
+			continue
+		}
+		guestNUMANode, mapped := mapGraceHostToGuestNUMANode(hostNUMANode, guestNUMANodes, hostToGuestNUMA)
+		if !mapped {
+			return nil, fmt.Errorf("grace guest NUMA topology lacks representation for host NUMA node %d", hostNUMANode)
+		}
+		giDevices = append(giDevices, graceGPUNodeAssignment{
+			hostBDF:       bdf,
+			guestNUMANode: guestNUMANode,
+		})
+	}
+
+	slices.SortFunc(giDevices, func(a, b graceGPUNodeAssignment) int {
+		if a.guestNUMANode != b.guestNUMANode {
+			if a.guestNUMANode < b.guestNUMANode {
+				return -1
+			}
+			return 1
+		}
+		if a.hostBDF == b.hostBDF {
+			return 0
+		}
+		if a.hostBDF < b.hostBDF {
+			return -1
+		}
+		return 1
+	})
+
+	nextNodeID := nextGraceGINodeBase(domain)
+	for i := range giDevices {
+		giDevices[i].giStartNodeID = nextNodeID
+		giDevices[i].giEndNodeID = nextNodeID + graceHBMNodesPerGPU - 1
+		nextNodeID = giDevices[i].giEndNodeID + 1
+	}
+
+	return giDevices, nil
+}
+
+func nextGraceGINodeBase(domain *api.Domain) int {
+	if domain == nil || domain.Spec.CPU.NUMA == nil {
+		return graceHBMNodeSetBase
+	}
+	traditionalIDs := make(map[int]struct{})
+	if domain.Spec.NUMATune != nil {
+		for _, memNode := range domain.Spec.NUMATune.MemNodes {
+			traditionalIDs[int(memNode.CellID)] = struct{}{}
+		}
+	}
+	maxTraditionalID := -1
+	for _, cell := range domain.Spec.CPU.NUMA.Cells {
+		id, err := strconv.Atoi(strings.TrimSpace(cell.ID))
+		if err != nil {
+			continue
+		}
+		if _, ok := traditionalIDs[id]; !ok && strings.TrimSpace(cell.CPUs) == "" && cell.Memory == 0 {
+			continue
+		}
+		if id > maxTraditionalID {
+			maxTraditionalID = id
+		}
+	}
+	nextNodeID := maxTraditionalID + 1
+	if nextNodeID < graceHBMNodeSetBase {
+		nextNodeID = graceHBMNodeSetBase
+	}
+	return nextNodeID
+}
+
+func ensureGraceGuestNUMACellRange(domain *api.Domain, startNodeID, endNodeID int) {
+	if domain == nil || startNodeID > endNodeID {
+		return
+	}
+	if domain.Spec.CPU.NUMA == nil {
+		domain.Spec.CPU.NUMA = &api.NUMA{}
+	}
+	existing := make(map[int]struct{}, len(domain.Spec.CPU.NUMA.Cells))
+	for _, cell := range domain.Spec.CPU.NUMA.Cells {
+		id, err := strconv.Atoi(strings.TrimSpace(cell.ID))
+		if err != nil {
+			continue
+		}
+		existing[id] = struct{}{}
+	}
+	for id := startNodeID; id <= endNodeID; id++ {
+		if _, found := existing[id]; found {
+			continue
+		}
+		domain.Spec.CPU.NUMA.Cells = append(domain.Spec.CPU.NUMA.Cells, api.NUMACell{
+			ID:     strconv.Itoa(id),
+			Memory: 0,
+			Unit:   "KiB",
+		})
+	}
+	slices.SortFunc(domain.Spec.CPU.NUMA.Cells, func(a, b api.NUMACell) int {
+		ai, errA := strconv.Atoi(strings.TrimSpace(a.ID))
+		bi, errB := strconv.Atoi(strings.TrimSpace(b.ID))
+		switch {
+		case errA == nil && errB == nil:
+			if ai == bi {
+				return 0
+			}
+			if ai < bi {
+				return -1
+			}
+			return 1
+		case errA == nil:
+			return -1
+		case errB == nil:
+			return 1
+		default:
+			if a.ID == b.ID {
+				return 0
+			}
+			if a.ID < b.ID {
+				return -1
+			}
+			return 1
+		}
+	})
+}
+
+func getGuestNUMANodes(domain *api.Domain) map[int]struct{} {
+	result := make(map[int]struct{})
+	if domain == nil || domain.Spec.CPU.NUMA == nil {
+		return result
+	}
+	for _, cell := range domain.Spec.CPU.NUMA.Cells {
+		id, err := strconv.Atoi(strings.TrimSpace(cell.ID))
+		if err == nil {
+			result[id] = struct{}{}
+		}
+	}
+	return result
+}
+
+func getHostToGuestNUMAMap(domain *api.Domain) map[int]int {
+	result := make(map[int]int)
+	if domain == nil || domain.Spec.NUMATune == nil {
+		return result
+	}
+	for _, node := range domain.Spec.NUMATune.MemNodes {
+		if strings.TrimSpace(node.NodeSet) == "" {
+			continue
+		}
+		values, err := hardware.ParseCPUSetLine(node.NodeSet, 1024)
+		if err != nil {
+			continue
+		}
+		for _, host := range values {
+			result[host] = int(node.CellID)
+		}
+	}
+	return result
+}
+
+func mapGraceHostToGuestNUMANode(hostNode int, guestNodes map[int]struct{}, hostToGuest map[int]int) (int, bool) {
+	if mapped, ok := hostToGuest[hostNode]; ok {
+		return mapped, true
+	}
+	if _, ok := guestNodes[hostNode]; ok {
+		return hostNode, true
+	}
+	if len(guestNodes) == 0 {
+		return hostNode, false
+	}
+	guestList := make([]int, 0, len(guestNodes))
+	for node := range guestNodes {
+		guestList = append(guestList, node)
+	}
+	slices.Sort(guestList)
+	return guestList[0], false
+}
+
+func resolveGraceHostDevicePCIAddress(dev *api.HostDevice) (string, error) {
+	if dev == nil || dev.Source.Address == nil {
+		return "", fmt.Errorf("host device address missing")
+	}
+	addr := dev.Source.Address
+	if addr.UUID != "" {
+		return hardware.GetMdevParentPCIAddress(addr.UUID)
+	}
+	if addr.Domain == "" || addr.Bus == "" || addr.Slot == "" || addr.Function == "" {
+		return "", fmt.Errorf("unsupported host device address format")
+	}
+	return hardware.FormatPCIAddress(addr)
+}
+
+func getGraceDevicePCITotalMMIOSize(bdf string) (uint64, error) {
+	resourcePath := filepath.Join("/sys/bus/pci/devices", bdf, "resource")
+	f, err := os.Open(resourcePath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	var total uint64
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		start, err := strconv.ParseUint(fields[0], 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		end, err := strconv.ParseUint(fields[1], 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		flags, err := strconv.ParseUint(fields[2], 0, 64)
+		if err != nil {
+			return 0, err
+		}
+		if flags&graceIOResourceMemFlag == 0 || (start == 0 && end == 0) || end < start {
+			continue
+		}
+		total += end - start + 1
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // numaMapping maps numa nodes based on already applied VCPU pinning. The sort result is stable compared to the order
