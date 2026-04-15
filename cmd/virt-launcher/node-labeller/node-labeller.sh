@@ -36,11 +36,21 @@ fi
 
 virtqemud -d
 
-virsh domcapabilities --machine $MACHINE --arch $ARCH --virttype $VIRTTYPE > /var/lib/kubevirt-node-labeller/virsh_domcapabilities.xml
+URI="qemu:///system"
+
+# Wait briefly for virtqemud to create its system socket before querying capabilities.
+for i in $(seq 1 20); do
+  if virsh -c "$URI" uri >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+
+virsh -c "$URI" domcapabilities --machine $MACHINE --arch $ARCH --virttype $VIRTTYPE > /var/lib/kubevirt-node-labeller/virsh_domcapabilities.xml
 
 # hypervisor-cpu-baseline command only works on x86 and s390x
 if [ "$ARCH" == "x86_64" ] || [ "$ARCH" == "s390x" ]; then
-   virsh domcapabilities --machine $MACHINE --arch $ARCH --virttype $VIRTTYPE | virsh hypervisor-cpu-baseline --features /dev/stdin --machine $MACHINE --arch $ARCH --virttype $VIRTTYPE > /var/lib/kubevirt-node-labeller/supported_features.xml
+   virsh -c "$URI" domcapabilities --machine $MACHINE --arch $ARCH --virttype $VIRTTYPE | virsh -c "$URI" hypervisor-cpu-baseline --features /dev/stdin --machine $MACHINE --arch $ARCH --virttype $VIRTTYPE > /var/lib/kubevirt-node-labeller/supported_features.xml
 fi
 
-virsh capabilities > /var/lib/kubevirt-node-labeller/capabilities.xml
+virsh -c "$URI" capabilities > /var/lib/kubevirt-node-labeller/capabilities.xml

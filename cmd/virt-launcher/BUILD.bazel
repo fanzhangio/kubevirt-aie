@@ -130,6 +130,61 @@ pkg_tar(
     package_dir = "/etc/libvirt",
 )
 
+genrule(
+    name = "libvirt-cpu-map-neoverse-v3-files",
+    srcs = ["//rpm:launcherbase_aarch64"],
+    outs = [
+        "arm_Neoverse-V3.xml",
+        "index.xml",
+    ],
+    cmd = """
+set -euo pipefail
+tmp=$$(mktemp -d)
+tar -xf $(location //rpm:launcherbase_aarch64) -C "$$tmp" --wildcards --no-anchored "usr/share/libvirt/cpu_map/index.xml"
+index="$$tmp/usr/share/libvirt/cpu_map/index.xml"
+out_index="$(RULEDIR)/index.xml"
+
+if grep -qE 'Neoverse-V3|arm_Neoverse-V3.xml' "$$index" 2>/dev/null; then
+  cp "$$index" "$$out_index"
+else
+  awk '
+    BEGIN { in_a64=0; inserted=0 }
+    /<arch[[:space:]]+name='\\''aarch64'\\''>/ { in_a64=1 }
+    in_a64 && !inserted && /arm_Neoverse-V2\\.xml/ {
+      print
+      print "  <include filename='\\''arm_Neoverse-V3.xml'\\''/>"
+      inserted=1
+      next
+    }
+    in_a64 && /<\\/arch>/ {
+      if (!inserted) {
+        print "  <include filename='\\''arm_Neoverse-V3.xml'\\''/>"
+        inserted=1
+      }
+      in_a64=0
+    }
+    { print }
+  ' "$$index" > "$$out_index"
+fi
+
+cat > "$(RULEDIR)/arm_Neoverse-V3.xml" <<'EOF'
+<cpus>
+  <cpu name='Neoverse-V3'>
+    <vendor>ARM</vendor>
+    <pvr value='0x0d4f'/>
+  </cpu>
+</cpus>
+EOF
+""",
+)
+
+pkg_tar(
+    name = "libvirt-cpu-map-neoverse-v3",
+    srcs = [":libvirt-cpu-map-neoverse-v3-files"],
+    mode = "0644",
+    package_dir = "/usr/share/libvirt/cpu_map",
+)
+
 pkg_tar(
     name = "passwd-tar",
     srcs = [
@@ -188,6 +243,7 @@ oci_image(
         "@io_bazel_rules_go//go/platform:linux_arm64": [
             "//rpm:launcherbase_aarch64",
             ":get-version-tar",
+            ":libvirt-cpu-map-neoverse-v3",
             ":libvirt-config",
             ":passwd-tar",
             ":nsswitch-tar",

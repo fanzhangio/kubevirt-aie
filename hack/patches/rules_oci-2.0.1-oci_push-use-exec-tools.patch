@@ -1,0 +1,58 @@
+--- a/oci/private/push.bzl
++++ b/oci/private/push.bzl
+@@ -137,19 +137,16 @@ _DOC = """Push an oci_image or oci_image_index to a remote registry.
+ 
+ # Helper rule for ensuring that the crane and yq toolchains are actually
+-# resolved for the architecture we are targeting.
+-def _transition_to_target_impl(settings, _attr):
+-    return {
+-        # String conversion is needed to prevent a crash with Bazel 6.x.
+-        "//command_line_option:extra_execution_platforms": [
+-            str(platform)
+-            for platform in settings["//command_line_option:platforms"]
+-        ],
+-    }
+-
+-_transition_to_target = transition(
+-    implementation = _transition_to_target_impl,
+-    inputs = ["//command_line_option:platforms"],
+-    outputs = ["//command_line_option:extra_execution_platforms"],
+-)
++# resolved for the architecture we are targeting.
++#
++# KubeVirt builds multi-arch images (e.g. linux/arm64) on an amd64 builder, and
++# then runs the push action locally. The pusher (and its helper tools like jq/crane)
++# must therefore be built for the *execution* platform, not the target image platform.
++#
++# Use exec-configured tools instead.
+ 
+ _attrs = {
+@@ -180,16 +177,13 @@ _attrs = {
+         """,
+         allow_single_file = [".txt"],
+     ),
+-    "_allowlist_function_transition": attr.label(
+-        default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+-    ),
+     "_crane": attr.label(
+-        cfg = _transition_to_target,
++        cfg = "exec",
+         default = "@oci_crane_toolchains//:current_toolchain",
+     ),
+@@ -192,7 +186,7 @@ _attrs = {
+     ),
+     "_windows_constraint": attr.label(default = "@platforms//os:windows"),
+     "_jq": attr.label(
+-        cfg = _transition_to_target,
++        cfg = "exec",
+         default = "@jq_toolchains//:resolved_toolchain",
+     ),
+ }
+@@ -201,5 +195,5 @@ def _impl(ctx):
+-    crane = ctx.attr._crane[0][platform_common.ToolchainInfo]
+-    jq = ctx.attr._jq[0][platform_common.ToolchainInfo]
++    crane = ctx.attr._crane[platform_common.ToolchainInfo]
++    jq = ctx.attr._jq[platform_common.ToolchainInfo]
+ 
+     if ctx.attr.repository and ctx.attr.repository_file:
+         fail("must specify exactly one of 'repository_file' or 'repository'")
