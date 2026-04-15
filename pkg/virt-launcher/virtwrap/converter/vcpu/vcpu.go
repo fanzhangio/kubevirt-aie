@@ -2,7 +2,6 @@ package vcpu
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	v12 "kubevirt.io/api/core/v1"
 
 	v1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
+	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/hardware"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
@@ -364,34 +364,14 @@ func isNumaPassthrough(vmi *v12.VirtualMachineInstance) bool {
 	return vmi.Spec.Domain.CPU.NUMA != nil && vmi.Spec.Domain.CPU.NUMA.GuestMappingPassthrough != nil
 }
 
-type graceVirtualizationConfig struct {
-	HostDevices *bool `json:"hostDevices,omitempty"`
-	EGM         *bool `json:"egm,omitempty"`
-}
-
 func isGraceEGMEnabled(vmi *v12.VirtualMachineInstance) bool {
-	cfg := getGraceVirtualizationConfig(vmi)
-	return cfg != nil && cfg.EGM != nil && *cfg.EGM
+	cfg := util.GetGraceVirtualizationConfig(vmi)
+	return cfg != nil && util.GraceFieldEnabled(cfg.EGM)
 }
 
 func isGraceHostDevicesEnabled(vmi *v12.VirtualMachineInstance) bool {
-	cfg := getGraceVirtualizationConfig(vmi)
-	return cfg != nil && cfg.HostDevices != nil && *cfg.HostDevices
-}
-
-func getGraceVirtualizationConfig(vmi *v12.VirtualMachineInstance) *graceVirtualizationConfig {
-	if vmi == nil || len(vmi.Annotations) == 0 {
-		return nil
-	}
-	raw, exists := vmi.Annotations[v12.GraceVirtualizationAnnotation]
-	if !exists || strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	cfg := &graceVirtualizationConfig{}
-	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		return nil
-	}
-	return cfg
+	cfg := util.GetGraceVirtualizationConfig(vmi)
+	return cfg != nil && util.GraceFieldEnabled(cfg.HostDevices)
 }
 
 func requiresStrictNUMAAffinity(vmi *v12.VirtualMachineInstance) bool {

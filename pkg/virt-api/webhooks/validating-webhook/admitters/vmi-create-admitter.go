@@ -48,6 +48,7 @@ import (
 	storageadmitters "kubevirt.io/kubevirt/pkg/storage/admitters"
 	"kubevirt.io/kubevirt/pkg/storage/reservation"
 	"kubevirt.io/kubevirt/pkg/storage/types"
+	"kubevirt.io/kubevirt/pkg/util"
 	hwutil "kubevirt.io/kubevirt/pkg/util/hardware"
 	webhookutils "kubevirt.io/kubevirt/pkg/util/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
@@ -1275,7 +1276,7 @@ func validateGraceVirtualizationAnnotation(metadataField, specField *k8sfield.Pa
 		return causes
 	}
 
-	cfg, err := parseGraceVirtualizationConfig(rawConfig)
+	cfg, err := util.ParseGraceVirtualizationConfigStrict(rawConfig)
 	if err != nil {
 		causes = append(causes, metav1.StatusCause{
 			Type: metav1.CauseTypeFieldValueInvalid,
@@ -1286,28 +1287,28 @@ func validateGraceVirtualizationAnnotation(metadataField, specField *k8sfield.Pa
 		return causes
 	}
 
-	if isEnabled(cfg.VCMDQ) && !isEnabled(cfg.SMMUv3) {
+	if util.GraceFieldEnabled(cfg.VCMDQ) && !util.GraceFieldEnabled(cfg.SMMUv3) {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: vcmdq requires smmuv3=true", annotationPath),
 			Field:   metadataField.Child("annotations").String(),
 		})
 	}
-	if isEnabled(cfg.EGM) && !isEnabled(cfg.SMMUv3) {
+	if util.GraceFieldEnabled(cfg.EGM) && !util.GraceFieldEnabled(cfg.SMMUv3) {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: egm requires smmuv3=true", annotationPath),
 			Field:   metadataField.Child("annotations").String(),
 		})
 	}
-	if isEnabled(cfg.EGM) && !isEnabled(cfg.HostDevices) {
+	if util.GraceFieldEnabled(cfg.EGM) && !util.GraceFieldEnabled(cfg.HostDevices) {
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: egm requires hostDevices=true", annotationPath),
 			Field:   metadataField.Child("annotations").String(),
 		})
 	}
-	if isEnabled(cfg.EGM) && (spec.Domain.CPU == nil || !spec.Domain.CPU.DedicatedCPUPlacement) {
+	if util.GraceFieldEnabled(cfg.EGM) && (spec.Domain.CPU == nil || !spec.Domain.CPU.DedicatedCPUPlacement) {
 		causes = append(causes, metav1.StatusCause{
 			Type: metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: egm requires domain.cpu.dedicatedCpuPlacement=true",
@@ -1315,7 +1316,7 @@ func validateGraceVirtualizationAnnotation(metadataField, specField *k8sfield.Pa
 			Field: specField.Child("domain", "cpu", "dedicatedCpuPlacement").String(),
 		})
 	}
-	if isEnabled(cfg.EGM) && spec.Domain.Memory != nil && spec.Domain.Memory.Hugepages != nil {
+	if util.GraceFieldEnabled(cfg.EGM) && spec.Domain.Memory != nil && spec.Domain.Memory.Hugepages != nil {
 		causes = append(causes, metav1.StatusCause{
 			Type: metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: egm requires EGM-backed file memory and does not support domain.memory.hugepages",
@@ -1323,7 +1324,7 @@ func validateGraceVirtualizationAnnotation(metadataField, specField *k8sfield.Pa
 			Field: specField.Child("domain", "memory", "hugepages").String(),
 		})
 	}
-	if isEnabled(cfg.VCMDQ) && isEnabled(cfg.SMMUv3) && !isEnabled(cfg.EGM) && !hasHugepagesConfigured(spec) {
+	if util.GraceFieldEnabled(cfg.VCMDQ) && util.GraceFieldEnabled(cfg.SMMUv3) && !util.GraceFieldEnabled(cfg.EGM) && !hasHugepagesConfigured(spec) {
 		causes = append(causes, metav1.StatusCause{
 			Type: metav1.CauseTypeFieldValueInvalid,
 			Message: fmt.Sprintf("invalid entry %s: vcmdq requires domain.memory.hugepages",

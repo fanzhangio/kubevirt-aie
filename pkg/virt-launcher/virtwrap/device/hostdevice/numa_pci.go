@@ -3,10 +3,8 @@ package hostdevice
 import (
 	"bufio"
 	"crypto/sha1"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +14,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/hardware"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
@@ -300,9 +299,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	if vmi == nil || domain == nil {
 		return nil
 	}
-	graceCfg := parseGraceVirtualizationConfig(vmi)
+	graceCfg := util.GetGraceVirtualizationConfig(vmi)
 	graceHostDevicesEnabled := isGraceHostDevicesEnabledForArch(vmi, graceCfg)
-	egmEnabled := graceCfg != nil && graceCfg.EGM != nil && *graceCfg.EGM
+	egmEnabled := graceCfg != nil && util.GraceFieldEnabled(graceCfg.EGM)
 	numaPassthroughEnabled := vmi.Spec.Domain.CPU != nil &&
 		vmi.Spec.Domain.CPU.NUMA != nil &&
 		vmi.Spec.Domain.CPU.NUMA.GuestMappingPassthrough != nil
@@ -1445,50 +1444,15 @@ func assignHostDeviceToRootPort(dev *api.HostDevice, port *rootPortInfo) {
 	dev.Address.Function = "0x0"
 }
 
-type graceVirtualizationHostDeviceConfig struct {
-	HostDevices *bool `json:"hostDevices,omitempty"`
-	SMMUv3      *bool `json:"smmuv3,omitempty"`
-	VCMDQ       *bool `json:"vcmdq,omitempty"`
-	EGM         *bool `json:"egm,omitempty"`
-	// Parsed for forward-compatibility; runtime handling comes in follow-up work.
-	NUMAStrictLocality *bool `json:"numaStrictLocality,omitempty"`
-}
-
-func parseGraceVirtualizationConfig(vmi *v1.VirtualMachineInstance) *graceVirtualizationHostDeviceConfig {
-	if vmi == nil || len(vmi.Annotations) == 0 {
-		return nil
-	}
-
-	rawConfig, exists := vmi.Annotations[v1.GraceVirtualizationAnnotation]
-	if !exists {
-		return nil
-	}
-
-	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(rawConfig)))
-	decoder.DisallowUnknownFields()
-
-	cfg := &graceVirtualizationHostDeviceConfig{}
-	if err := decoder.Decode(cfg); err != nil {
-		log.Log.V(1).Reason(err).Infof("ignoring invalid %s annotation", v1.GraceVirtualizationAnnotation)
-		return nil
-	}
-	var trailing struct{}
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		log.Log.V(1).Infof("ignoring invalid %s annotation: trailing content detected", v1.GraceVirtualizationAnnotation)
-		return nil
-	}
-	return cfg
-}
-
-func isGraceHostDevicesEnabledForArch(vmi *v1.VirtualMachineInstance, cfg *graceVirtualizationHostDeviceConfig) bool {
-	if cfg == nil || cfg.HostDevices == nil || !*cfg.HostDevices {
+func isGraceHostDevicesEnabledForArch(vmi *v1.VirtualMachineInstance, cfg *util.GraceVirtualizationConfig) bool {
+	if cfg == nil || !util.GraceFieldEnabled(cfg.HostDevices) {
 		return false
 	}
 	arch := strings.TrimSpace(vmi.Spec.Architecture)
 	return arch == "" || strings.EqualFold(arch, arm64Architecture)
 }
 
-func applyGraceSMMUv3IOMMUTopology(domain *api.Domain, cfg *graceVirtualizationHostDeviceConfig, graceHostDevicesEnabled bool, iommuFDDeviceAvailable bool) {
+func applyGraceSMMUv3IOMMUTopology(domain *api.Domain, cfg *util.GraceVirtualizationConfig, graceHostDevicesEnabled bool, iommuFDDeviceAvailable bool) {
 	if domain == nil {
 		return
 	}
@@ -1505,12 +1469,12 @@ func applyGraceSMMUv3IOMMUTopology(domain *api.Domain, cfg *graceVirtualizationH
 	}
 	domain.Spec.Devices.IOMMUs = filtered
 
-	if !graceHostDevicesEnabled || cfg == nil || cfg.SMMUv3 == nil || !*cfg.SMMUv3 {
+	if !graceHostDevicesEnabled || cfg == nil || !util.GraceFieldEnabled(cfg.SMMUv3) {
 		return
 	}
 
 	pciBuses := collectNUMAPXBPciBuses(domain)
-	cmdqvRequested := cfg.VCMDQ != nil && *cfg.VCMDQ
+	cmdqvRequested := util.GraceFieldEnabled(cfg.VCMDQ)
 	for _, pciBus := range pciBuses {
 		accel := "off"
 		if iommuFDDeviceAvailable {
@@ -2022,7 +1986,7 @@ func PrepareGraceGuestNUMATopology(vmi *v1.VirtualMachineInstance, domain *api.D
 	if vmi == nil || domain == nil {
 		return nil
 	}
-	graceCfg := parseGraceVirtualizationConfig(vmi)
+	graceCfg := util.GetGraceVirtualizationConfig(vmi)
 	graceHostDevicesEnabled := isGraceHostDevicesEnabledForArch(vmi, graceCfg)
 	if !graceHostDevicesEnabled {
 		return nil

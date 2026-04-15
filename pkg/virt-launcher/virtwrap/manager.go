@@ -29,7 +29,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -882,26 +881,9 @@ func (l *LibvirtDomainManager) preStartHook(vmi *v1.VirtualMachineInstance, doma
 	return domain, err
 }
 
-type graceVirtualizationDiskConfig struct {
-	EGM *bool `json:"egm,omitempty"`
-}
-
 func isGraceEGMEnabled(vmi *v1.VirtualMachineInstance) bool {
-	if vmi == nil || len(vmi.Annotations) == 0 {
-		return false
-	}
-
-	rawConfig, exists := vmi.Annotations[v1.GraceVirtualizationAnnotation]
-	if !exists || strings.TrimSpace(rawConfig) == "" {
-		return false
-	}
-
-	cfg := &graceVirtualizationDiskConfig{}
-	if err := json.Unmarshal([]byte(rawConfig), cfg); err != nil {
-		return false
-	}
-
-	return cfg.EGM != nil && *cfg.EGM
+	cfg := kutil.GetGraceVirtualizationConfig(vmi)
+	return cfg != nil && kutil.GraceFieldEnabled(cfg.EGM)
 }
 
 func applyGraceEGMSafeDiskDefaults(vmi *v1.VirtualMachineInstance, domainSpec *api.DomainSpec) {

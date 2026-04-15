@@ -26,7 +26,6 @@ package converter
 */
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -88,32 +87,9 @@ type EFIConfiguration struct {
 	SecureLoader bool
 }
 
-type graceVirtualizationConfig struct {
-	EGM   *bool `json:"egm,omitempty"`
-	VCMDQ *bool `json:"vcmdq,omitempty"`
-}
-
-func getGraceVirtualizationConfig(vmi *v1.VirtualMachineInstance) *graceVirtualizationConfig {
-	if vmi == nil || len(vmi.Annotations) == 0 {
-		return nil
-	}
-
-	rawConfig, exists := vmi.Annotations[v1.GraceVirtualizationAnnotation]
-	if !exists || rawConfig == "" {
-		return nil
-	}
-
-	cfg := &graceVirtualizationConfig{}
-	if err := json.Unmarshal([]byte(rawConfig), cfg); err != nil {
-		return nil
-	}
-
-	return cfg
-}
-
 func configureGraceEGMFileBackedMemory(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
-	cfg := getGraceVirtualizationConfig(vmi)
-	egmEnabled := cfg != nil && cfg.EGM != nil && *cfg.EGM
+	cfg := util.GetGraceVirtualizationConfig(vmi)
+	egmEnabled := cfg != nil && util.GraceFieldEnabled(cfg.EGM)
 	if !egmEnabled {
 		return nil
 	}
@@ -137,8 +113,8 @@ func configureGraceEGMFileBackedMemory(vmi *v1.VirtualMachineInstance, domain *a
 }
 
 func configureGraceEGMDomainMemoryLayout(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
-	cfg := getGraceVirtualizationConfig(vmi)
-	egmEnabled := cfg != nil && cfg.EGM != nil && *cfg.EGM
+	cfg := util.GetGraceVirtualizationConfig(vmi)
+	egmEnabled := cfg != nil && util.GraceFieldEnabled(cfg.EGM)
 	if !egmEnabled {
 		return nil
 	}

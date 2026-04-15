@@ -20,45 +20,15 @@
 package admitters
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 
 	v1 "kubevirt.io/api/core/v1"
+
+	"kubevirt.io/kubevirt/pkg/util"
 )
-
-type graceVirtualizationConfig struct {
-	HostDevices        *bool `json:"hostDevices,omitempty"`
-	SMMUv3             *bool `json:"smmuv3,omitempty"`
-	VCMDQ              *bool `json:"vcmdq,omitempty"`
-	EGM                *bool `json:"egm,omitempty"`
-	NUMAStrictLocality *bool `json:"numaStrictLocality,omitempty"`
-}
-
-func parseGraceVirtualizationConfig(raw string) (*graceVirtualizationConfig, error) {
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	decoder.DisallowUnknownFields()
-
-	cfg := &graceVirtualizationConfig{}
-	if err := decoder.Decode(cfg); err != nil {
-		return nil, err
-	}
-
-	var trailing struct{}
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, fmt.Errorf("invalid trailing content")
-	}
-
-	return cfg, nil
-}
-
-func isEnabled(value *bool) bool {
-	return value != nil && *value
-}
 
 func graceEGMEnabled(annotations map[string]string) bool {
 	if len(annotations) == 0 {
@@ -70,8 +40,8 @@ func graceEGMEnabled(annotations map[string]string) bool {
 		return false
 	}
 
-	cfg, err := parseGraceVirtualizationConfig(rawConfig)
-	return err == nil && isEnabled(cfg.EGM)
+	cfg, err := util.ParseGraceVirtualizationConfigStrict(rawConfig)
+	return err == nil && util.GraceFieldEnabled(cfg.EGM)
 }
 
 func filterNUMAHugepagesRequirementForGraceEGM(causes []metav1.StatusCause, field *k8sfield.Path, annotations map[string]string) []metav1.StatusCause {
@@ -84,8 +54,8 @@ func filterNUMAHugepagesRequirementForGraceEGM(causes []metav1.StatusCause, fiel
 		return causes
 	}
 
-	cfg, err := parseGraceVirtualizationConfig(rawConfig)
-	if err != nil || !isEnabled(cfg.EGM) {
+	cfg, err := util.ParseGraceVirtualizationConfigStrict(rawConfig)
+	if err != nil || !util.GraceFieldEnabled(cfg.EGM) {
 		return causes
 	}
 
