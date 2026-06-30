@@ -419,4 +419,107 @@ var _ = Describe("CalculateMemlockSize", func() {
 				{Name: "sriov2", InterfaceBindingMethod: v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}},
 			}}, 1),
 	)
+
+	It("should add Grace GPU BAR memlock floor for Grace resources", func() {
+		const graceBARFloor = int64(512 * 1024 * 1024 * 1024)
+
+		vmi := &v1.VirtualMachineInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-vmi"},
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Resources: v1.ResourceRequirements{
+						Requests: k8sv1.ResourceList{
+							k8sv1.ResourceMemory: resource.MustParse("8Gi"),
+						},
+					},
+					Devices: v1.Devices{
+						GPUs: []v1.GPU{{Name: "gpu1", DeviceName: "nvidia.com/grace-gpu"}},
+					},
+				},
+			},
+		}
+		vmiBaseline := vmi.DeepCopy()
+		vmiBaseline.Spec.Domain.Devices = v1.Devices{}
+
+		config := &v1.KubeVirtConfiguration{
+			PermittedHostDevices: &v1.PermittedHostDevices{
+				PciHostDevices: []v1.PciHostDevice{{
+					PCIVendorSelector: "10de:2342",
+					ResourceName:      "nvidia.com/grace-gpu",
+				}},
+			},
+		}
+
+		size := runtime.CalculateMemlockSize(vmi, config)
+		baselineSize := runtime.CalculateMemlockSize(vmiBaseline, config)
+
+		vfioBase := int64(1024 * 1024 * 1024)
+		expectedDiff := vfioBase + graceBARFloor
+		Expect(size.Value() - baselineSize.Value()).To(BeNumerically("~", expectedDiff, 1024*1024))
+	})
+
+	It("should add Grace GPU BAR memlock floor per Grace IOMMU address space", func() {
+		const graceBARFloor = int64(512 * 1024 * 1024 * 1024)
+
+		vmi := &v1.VirtualMachineInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-vmi"},
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Resources: v1.ResourceRequirements{
+						Requests: k8sv1.ResourceList{
+							k8sv1.ResourceMemory: resource.MustParse("8Gi"),
+						},
+					},
+					Devices: v1.Devices{
+						GPUs: []v1.GPU{
+							{Name: "gpu1", DeviceName: "nvidia.com/grace-gpu"},
+							{Name: "gpu2", DeviceName: "nvidia.com/grace-gpu"},
+						},
+					},
+				},
+			},
+		}
+		vmiBaseline := vmi.DeepCopy()
+		vmiBaseline.Spec.Domain.Devices = v1.Devices{}
+
+		config := &v1.KubeVirtConfiguration{
+			PermittedHostDevices: &v1.PermittedHostDevices{
+				PciHostDevices: []v1.PciHostDevice{{
+					PCIVendorSelector: "10de:2342",
+					ResourceName:      "nvidia.com/grace-gpu",
+				}},
+			},
+		}
+
+		size := runtime.CalculateMemlockSize(vmi, config)
+		baselineSize := runtime.CalculateMemlockSize(vmiBaseline, config)
+
+		guestMem := int64(8 * 1024 * 1024 * 1024)
+		vfioBase := int64(1024 * 1024 * 1024)
+		graceAddressSpaces := int64(2)
+		graceDevices := int64(2)
+		expectedDiff := vfioBase + guestMem + graceBARFloor*graceDevices*graceAddressSpaces
+		Expect(size.Value() - baselineSize.Value()).To(BeNumerically("~", expectedDiff, 1024*1024))
+	})
+
+	It("should not add Grace GPU BAR memlock floor for non-Grace NVIDIA resources", func() {
+		vmi := &v1.VirtualMachineInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-vmi"},
+			Spec: v1.VirtualMachineInstanceSpec{
+				Domain: v1.DomainSpec{
+					Resources: v1.ResourceRequirements{Requests: k8sv1.ResourceList{k8sv1.ResourceMemory: resource.MustParse("8Gi")}},
+					Devices:   v1.Devices{GPUs: []v1.GPU{{Name: "gpu1", DeviceName: "nvidia.com/non-grace-gpu"}}},
+				},
+			},
+		}
+		vmiBaseline := vmi.DeepCopy()
+		vmiBaseline.Spec.Domain.Devices = v1.Devices{}
+		config := &v1.KubeVirtConfiguration{PermittedHostDevices: &v1.PermittedHostDevices{PciHostDevices: []v1.PciHostDevice{{PCIVendorSelector: "10de:2330", ResourceName: "nvidia.com/non-grace-gpu"}}}}
+
+		size := runtime.CalculateMemlockSize(vmi, config)
+		baselineSize := runtime.CalculateMemlockSize(vmiBaseline, config)
+
+		vfioBase := int64(1024 * 1024 * 1024)
+		Expect(size.Value() - baselineSize.Value()).To(BeNumerically("~", vfioBase, 1024*1024))
+	})
 })

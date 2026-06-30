@@ -46,6 +46,8 @@ type KvmVirtRuntime struct {
 	KvmHypervisorBackend
 }
 
+const graceVFIOBARMemlockFloorBytes = int64(512) << 30
+
 func NewKvmVirtRuntime(podIsoDetector isolation.PodIsolationDetector, logger *log.FilteredLogger) *KvmVirtRuntime {
 	return &KvmVirtRuntime{
 		podIsolationDetector: podIsoDetector,
@@ -138,7 +140,60 @@ func (k *KvmVirtRuntime) CalculateMemlockSize(vmi *v1.VirtualMachineInstance, co
 		memlockSize.Add(extra)
 	}
 
+	if numGraceDevices := countGraceVFIODevices(vmi, config); numGraceDevices > 0 {
+		memlockSize.Add(*resource.NewQuantity(calculateGraceVFIOBARMemlockSize(numGraceDevices), resource.BinarySI))
+	}
+
 	return memlockSize
+}
+
+func calculateGraceVFIOBARMemlockSize(numGraceDevices int) int64 {
+	if numGraceDevices <= 0 {
+		return 0
+	}
+
+	// The Grace conversion places each Grace device behind its own
+	// SMMUv3/IOMMUFD address space. QEMU maps every large Grace BAR into
+	// those address spaces for peer-to-peer setup, so reserve one BAR
+	// floor per Grace device per Grace address space.
+	graceDevices := int64(numGraceDevices)
+	graceAddressSpaces := int64(numGraceDevices)
+	return graceVFIOBARMemlockFloorBytes * graceDevices * graceAddressSpaces
+}
+
+func countGraceVFIODevices(vmi *v1.VirtualMachineInstance, config *v1.KubeVirtConfiguration) int {
+	if vmi == nil || config == nil || config.PermittedHostDevices == nil {
+		return 0
+	}
+
+	graceResources := gracePCIResourceNames(config.PermittedHostDevices)
+	if len(graceResources) == 0 {
+		return 0
+	}
+
+	count := 0
+	for _, gpu := range vmi.Spec.Domain.Devices.GPUs {
+		if _, exists := graceResources[gpu.DeviceName]; exists {
+			count++
+		}
+	}
+	for _, hostDevice := range vmi.Spec.Domain.Devices.HostDevices {
+		if _, exists := graceResources[hostDevice.DeviceName]; exists {
+			count++
+		}
+	}
+	return count
+}
+
+func gracePCIResourceNames(permittedHostDevices *v1.PermittedHostDevices) map[string]struct{} {
+	resources := map[string]struct{}{}
+	for _, pciHostDevice := range permittedHostDevices.PciHostDevices {
+		if pciHostDevice.ResourceName == "" || !hardware.IsNVIDIAGracePCIVendorSelector(pciHostDevice.PCIVendorSelector) {
+			continue
+		}
+		resources[pciHostDevice.ResourceName] = struct{}{}
+	}
+	return resources
 }
 
 func getVMIBaseMemory(vmi *v1.VirtualMachineInstance) *resource.Quantity {
