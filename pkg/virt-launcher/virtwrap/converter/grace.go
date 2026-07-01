@@ -51,11 +51,13 @@ const (
 	pciBaseAddressMemoryType64   = uint64(0x00000004)
 	pciBaseAddressMemoryPrefetch = uint64(0x00000008)
 
-	graceDefaultIOMMUAccel   = "on"
-	graceDefaultIOMMUATS     = "on"
-	graceDefaultIOMMURIL     = "off"
-	graceSMMUv3IOMMUModel    = "smmuv3"
-	graceHostDeviceIOMMUFDOn = "yes"
+	graceDefaultIOMMUAccel    = "on"
+	graceDefaultIOMMUATS      = "on"
+	graceDefaultIOMMURIL      = "off"
+	graceDefaultIOMMUSSIDSize = "20"
+	graceDefaultIOMMUOAS      = "48"
+	graceSMMUv3IOMMUModel     = "smmuv3"
+	graceHostDeviceIOMMUFDOn  = "yes"
 )
 
 type verifiedGraceHostDevice struct {
@@ -647,6 +649,12 @@ func (capabilities gracePCICapabilities) withDefaults() gracePCICapabilities {
 	}
 	if capabilities.RIL == "" {
 		capabilities.RIL = graceDefaultIOMMURIL
+	}
+	if capabilities.SSIDSize == "" {
+		capabilities.SSIDSize = graceDefaultIOMMUSSIDSize
+	}
+	if capabilities.OAS == "" {
+		capabilities.OAS = graceDefaultIOMMUOAS
 	}
 	return capabilities
 }
